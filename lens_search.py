@@ -1,15 +1,20 @@
-"""Google Lens reverse image search via SerpApi, with a Catbox fallback
-for source images whose URL isn't already publicly reachable (Discord's
-CDN URLs are used as-is)."""
+"""Google Lens reverse image search via SerpApi.
+
+SerpApi needs a publicly fetchable image URL. Discord CDN URLs already are
+one, and so is any ordinary hotlinkable image URL, so URLs are passed
+straight through. An earlier version re-uploaded non-Discord URLs to
+Catbox first; that was dropped because it broke working URLs and Catbox
+has uploads disabled (HTTP 412, "Uploads paused until I can resolve
+storage issues"). If a re-host ever becomes necessary, note that
+detecting the need costs a second SerpApi search, which matters on the
+100-searches/month free tier.
+"""
 
 from __future__ import annotations
 
 import aiohttp
 
 SERPAPI_URL = "https://serpapi.com/search"
-CATBOX_URL = "https://catbox.moe/user/api.php"
-
-DISCORD_CDN_HOSTS = ("cdn.discordapp.com", "media.discordapp.net")
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=25)
 
@@ -26,24 +31,25 @@ class LensAuthError(LensSearchError):
     """The SerpApi key is missing or rejected."""
 
 
-async def ensure_public_url(session: aiohttp.ClientSession, image_url: str) -> str:
-    if any(host in image_url for host in DISCORD_CDN_HOSTS):
-        return image_url
-    return await _upload_to_catbox(session, image_url)
+class LensNoResults(LensSearchError):
+    """The search ran fine but Google Lens matched nothing.
+
+    SerpApi reports this through the `error` field rather than an empty
+    result set, so it has to be teased apart from real failures. Lens also
+    returns this when it cannot fetch the image at all - notably for
+    `upload.wikimedia.org` URLs, which silently yield nothing.
+    """
 
 
-async def _upload_to_catbox(session: aiohttp.ClientSession, image_url: str) -> str:
-    data = {"reqtype": "urlupload", "url": image_url}
-    try:
-        async with session.post(CATBOX_URL, data=data, timeout=REQUEST_TIMEOUT) as resp:
-            text = (await resp.text()).strip()
-            status = resp.status
-    except (aiohttp.ClientError, TimeoutError) as exc:
-        raise LensSearchError("couldn't fetch that image URL") from exc
+class LensBadImageUrl(LensSearchError):
+    """The supplied string isn't a usable http(s) image URL."""
 
-    if status != 200 or not text.startswith("http"):
-        raise LensSearchError("couldn't fetch that image URL")
-    return text
+
+def validate_image_url(image_url: str) -> str:
+    url = (image_url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise LensBadImageUrl("that doesn't look like an image link")
+    return url
 
 
 async def search_google_lens(
@@ -54,7 +60,7 @@ async def search_google_lens(
         # `type` is required by SerpApi; visual_matches is the tab that
         # yields "where did this image come from" style results.
         "type": "visual_matches",
-        "url": image_url,
+        "url": validate_image_url(image_url),
         "api_key": api_key,
     }
     try:
@@ -78,6 +84,8 @@ async def search_google_lens(
 
 def _classify_error(error: str, status: int) -> LensSearchError:
     lowered = error.lower()
+    if "hasn't returned any results" in lowered or "no results" in lowered:
+        return LensNoResults(error)
     if status == 429 or "run out" in lowered or "exceeded" in lowered or "quota" in lowered:
         return LensQuotaExceeded(error)
     if status == 401 or "invalid api key" in lowered:

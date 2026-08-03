@@ -14,12 +14,15 @@ from dotenv import load_dotenv
 
 from lens_search import (
     LensAuthError,
+    LensBadImageUrl,
+    LensNoResults,
     LensQuotaExceeded,
     LensSearchError,
-    ensure_public_url,
     search_google_lens,
     top_matches,
 )
+
+NO_MATCH_MESSAGE = "No reliable source found for this image."
 
 load_dotenv()
 
@@ -92,8 +95,11 @@ def build_embed(payload: dict) -> discord.Embed | None:
 async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | None]:
     """Returns (embed, error_message) - exactly one of the two is set."""
     try:
-        public_url = await ensure_public_url(bot.session, image_url)
-        payload = await search_google_lens(bot.session, public_url, SERPAPI_KEY)
+        payload = await search_google_lens(bot.session, image_url, SERPAPI_KEY)
+    except LensBadImageUrl as exc:
+        return None, f"Couldn't search for that image \N{EM DASH} {exc}."
+    except LensNoResults:
+        return None, NO_MATCH_MESSAGE
     except LensQuotaExceeded:
         log.warning("SerpApi quota exhausted")
         return None, "This bot has hit its SerpApi search quota for now. Please try again later."
@@ -109,7 +115,7 @@ async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | No
 
     embed = build_embed(payload)
     if embed is None:
-        return None, "No reliable source found for this image."
+        return None, NO_MATCH_MESSAGE
     return embed, None
 
 
