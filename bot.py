@@ -13,6 +13,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from lens_search import (
+    LensAuthError,
     LensQuotaExceeded,
     LensSearchError,
     ensure_public_url,
@@ -94,9 +95,14 @@ async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | No
         public_url = await ensure_public_url(bot.session, image_url)
         payload = await search_google_lens(bot.session, public_url, SERPAPI_KEY)
     except LensQuotaExceeded:
+        log.warning("SerpApi quota exhausted")
         return None, "This bot has hit its SerpApi search quota for now. Please try again later."
+    except LensAuthError:
+        log.error("SerpApi rejected the API key")
+        return None, "This bot's search API key isn't working. Please tell the server admin."
     except LensSearchError as exc:
-        return None, f"Couldn't search for that image: {exc}"
+        log.warning("Lens search failed: %s", exc)
+        return None, f"Couldn't search for that image \N{EM DASH} {exc}."
     except Exception:
         log.exception("Unexpected error during Google Lens search")
         return None, "Something went wrong while searching for that image."
@@ -105,11 +111,6 @@ async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | No
     if embed is None:
         return None, "No reliable source found for this image."
     return embed, None
-
-
-async def reply_with_result(send, image_url: str) -> None:
-    embed, error = await perform_search(image_url)
-    await send(content=error, embed=embed)
 
 
 @bot.tree.context_menu(name="Find Source")
