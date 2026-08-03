@@ -34,6 +34,21 @@ Double-click **`startup.bat`** (Windows) or run **`./startup.sh`** (macOS/Linux/
 Either one creates the virtualenv and installs dependencies on first run, then starts
 the bot. They stop with a clear message if `.env` is missing.
 
+### Verbose logging
+
+Pass `-v` (or `--verbose`) to either script to turn on debug logging and unmute
+pip's output:
+
+```bat
+startup.bat -v
+```
+
+Equivalently, set `LOG_LEVEL` in `.env` or the environment — one of `DEBUG`,
+`INFO` (default), `WARNING`, `ERROR`, `CRITICAL`. `DEBUG` logs every image URL
+searched and how many matches came back, and also enables discord.py's own
+gateway logging, which is very noisy. An unrecognised value falls back to `INFO`
+with a warning.
+
 Manually, if you prefer:
 
 ```bat

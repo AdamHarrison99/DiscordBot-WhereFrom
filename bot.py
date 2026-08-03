@@ -26,8 +26,29 @@ NO_MATCH_MESSAGE = "No reliable source found for this image."
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+_requested_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+LOG_LEVEL = _requested_level if _requested_level in VALID_LOG_LEVELS else "INFO"
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger("wherefrom")
+
+if _requested_level != LOG_LEVEL:
+    log.warning(
+        "Ignoring unrecognised LOG_LEVEL=%r; using INFO. Valid values: %s",
+        _requested_level,
+        ", ".join(VALID_LOG_LEVELS),
+    )
+
+# discord.py is extremely chatty at DEBUG (it logs every gateway payload), so
+# only let it follow LOG_LEVEL down to DEBUG when that was asked for explicitly.
+if LOG_LEVEL == "DEBUG":
+    logging.getLogger("discord").setLevel(logging.DEBUG)
+else:
+    logging.getLogger("discord").setLevel(logging.INFO)
 
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 SERPAPI_KEY = os.environ["SERPAPI_KEY"]
@@ -94,11 +115,14 @@ def build_embed(payload: dict) -> discord.Embed | None:
 
 async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | None]:
     """Returns (embed, error_message) - exactly one of the two is set."""
+    log.debug("Searching Google Lens for %s", image_url)
     try:
         payload = await search_google_lens(bot.session, image_url, SERPAPI_KEY)
     except LensBadImageUrl as exc:
+        log.debug("Rejected image URL %r: %s", image_url, exc)
         return None, f"Couldn't search for that image \N{EM DASH} {exc}."
     except LensNoResults:
+        log.debug("No visual matches for %s", image_url)
         return None, NO_MATCH_MESSAGE
     except LensQuotaExceeded:
         log.warning("SerpApi quota exhausted")
@@ -112,6 +136,9 @@ async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | No
     except Exception:
         log.exception("Unexpected error during Google Lens search")
         return None, "Something went wrong while searching for that image."
+
+    match_count = len(payload.get("visual_matches") or [])
+    log.debug("Google Lens returned %d visual matches for %s", match_count, image_url)
 
     embed = build_embed(payload)
     if embed is None:
@@ -187,4 +214,6 @@ async def on_ready() -> None:
 
 
 if __name__ == "__main__":
-    bot.run(DISCORD_BOT_TOKEN)
+    # log_handler=None stops discord.py installing a second handler on top of
+    # the basicConfig one above, which would double every log line.
+    bot.run(DISCORD_BOT_TOKEN, log_handler=None)
