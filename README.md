@@ -25,8 +25,24 @@ results (via [SerpApi](https://serpapi.com)).
 4. Invite the bot with scopes `bot applications.commands` and permissions:
    Send Messages, Embed Links, Read Message History, Use Application Commands.
 5. Get a SerpApi key at <https://serpapi.com> (free tier: 100 searches/month).
-6. Copy `.env.example` to `.env` (copy, don't rename — the example is the committed
+6. Optional but recommended: get a free SauceNAO key at <https://saucenao.com>
+   (register, then **account → api**) for the fallback described below.
+7. Copy `.env.example` to `.env` (copy, don't rename — the example is the committed
    template) and fill in `DISCORD_BOT_TOKEN` and `SERPAPI_KEY`.
+
+## How a lookup works
+
+Google Lens (via SerpApi) answers first. When it finds nothing, the bot retries
+through **SauceNAO**, which indexes Pixiv, Danbooru, yande.re, Twitter and
+DeviantArt — the illustration and anime sources Lens routinely misses. The reply
+embed names whichever engine found the match, and SauceNAO results also show a
+similarity percentage.
+
+The fallback only runs on a miss, so a Lens hit costs nothing extra. SauceNAO's
+free tier allows 100 searches/day and 6 per 30 seconds, well clear of SerpApi's
+100/month. Without `SAUCENAO_API_KEY` the bot just reports no match, as before.
+
+Matches below `SAUCENAO_MIN_SIMILARITY` (default 60%) are discarded as noise.
 
 ## Running it
 

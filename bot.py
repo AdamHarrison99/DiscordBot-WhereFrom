@@ -24,8 +24,15 @@ from lens_search import (
     LensNoResults,
     LensQuotaExceeded,
     LensSearchError,
+    normalize_matches,
     search_google_lens,
-    top_matches,
+)
+from sauce_search import (
+    DEFAULT_MIN_SIMILARITY,
+    SauceAuthError,
+    SauceError,
+    SauceQuotaExceeded,
+    search_saucenao,
 )
 
 NO_MATCH_MESSAGE = "No reliable source found for this image."
@@ -46,6 +53,15 @@ SIGNED_QUERY_PARAMS = frozenset({"ex", "is", "hm"})
 
 CONTROL_CHARS = re.compile(r"[\r\n\t\x00-\x1f]")
 
+# Both upstreams take their key as a query param. Nothing logs a full request
+# URL today, but one `raise_for_status()` would start - aiohttp puts the URL in
+# ClientResponseError - so scrub at the formatter and stop worrying about it.
+SECRET_PARAM = re.compile(r"((?:api_key|apikey|token|key)=)[^&\s\"']+", re.IGNORECASE)
+
+
+def redact_secrets(text: str) -> str:
+    return SECRET_PARAM.sub(r"\1<redacted>", text)
+
 
 def env_str(name: str, default: str = "") -> str:
     """A blank `KEY=` line counts as unset, so it still gets the default."""
@@ -61,6 +77,17 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
     except ValueError:
         return default
     return value if value >= minimum else default
+
+
+def env_float(name: str, default: float, minimum: float = 0.0, maximum: float = 100.0) -> float:
+    raw = env_str(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if minimum <= value <= maximum else default
 
 
 def scrub(text: str, limit: int = 200) -> str:
@@ -85,8 +112,15 @@ def shorten_url(url: str, limit: int = 100) -> str:
     return base if len(base) <= limit else base[:limit] + "..."
 
 
-class ConsoleFormatter(logging.Formatter):
-    """File format, but with URLs shortened for readability."""
+class RedactingFormatter(logging.Formatter):
+    """Strips API keys from anything written to a log."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_secrets(super().format(record))
+
+
+class ConsoleFormatter(RedactingFormatter):
+    """As above, but with URLs shortened for readability."""
 
     def format(self, record: logging.LogRecord) -> str:
         return URL_PATTERN.sub(lambda m: shorten_url(m.group(0)), super().format(record))
@@ -154,7 +188,7 @@ def build_output_handlers() -> tuple[list[logging.Handler], Path | None, str | N
     except OSError as exc:
         return handlers, None, f"Could not open log file {path}: {exc}"
 
-    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    file_handler.setFormatter(RedactingFormatter(LOG_FORMAT))
     file_handler.addFilter(DropDiscordChatter())
     handlers.append(file_handler)
     return handlers, path, None
@@ -203,6 +237,11 @@ else:
 
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 SERPAPI_KEY = os.environ["SERPAPI_KEY"]
+# Optional. Without it the bot simply doesn't fall back when Lens finds nothing.
+SAUCENAO_API_KEY = env_str("SAUCENAO_API_KEY")
+SAUCENAO_MIN_SIMILARITY = env_float("SAUCENAO_MIN_SIMILARITY", DEFAULT_MIN_SIMILARITY)
+
+MAX_SHOWN_MATCHES = 4
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 SAUCE_TRIGGERS = ("?sauce", "!sauce")
@@ -237,33 +276,30 @@ def find_image_attachment(message: discord.Message) -> discord.Attachment | None
     return next((a for a in message.attachments if is_image(a)), None)
 
 
-def build_embed(payload: dict) -> discord.Embed | None:
-    matches = top_matches(payload)
+def build_embed(matches: list[dict], engine: str) -> discord.Embed | None:
+    """Build the reply from normalised matches (see lens_search.normalize_matches)."""
     if not matches:
         return None
 
     top = matches[0]
     embed = discord.Embed(
-        title=(top.get("title") or "Untitled match")[:100],
-        url=top.get("link"),
+        title=top["title"][:100],
+        url=top["link"],
         color=discord.Color.blurple(),
     )
-    thumbnail = top.get("thumbnail") or top.get("image")
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
+    if top.get("thumbnail"):
+        embed.set_thumbnail(url=top["thumbnail"])
     if top.get("source"):
         embed.add_field(name="Source site", value=top["source"], inline=True)
+    if top.get("similarity") is not None:
+        embed.add_field(name="Similarity", value=f"{top['similarity']:.1f}%", inline=True)
 
-    extra = matches[1:4]
+    extra = matches[1:MAX_SHOWN_MATCHES]
     if extra:
-        lines = []
-        for match in extra:
-            title = (match.get("title") or "Untitled")[:80]
-            link = match.get("link")
-            lines.append(f"[{title}]({link})" if link else title)
+        lines = [f"[{m['title'][:80]}]({m['link']})" for m in extra]
         embed.add_field(name="Other matches", value="\n".join(lines), inline=False)
 
-    embed.set_footer(text="Source: Google Lens via SerpApi")
+    embed.set_footer(text=f"Source: {engine}")
     return embed
 
 
@@ -278,52 +314,111 @@ def describe_invocation(
     return f"{user} in {guild}/#{channel}"
 
 
-async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | None]:
-    """Returns (embed, error_message) - exactly one of the two is set."""
+def log_matches(engine: str, image_url: str, matches: list[dict]) -> None:
+    log.info("%s found %d match(es) for %s", engine, len(matches), image_url)
+    for i, match in enumerate(matches[:MAX_SHOWN_MATCHES], start=1):
+        log.info(
+            "  %d. [%s] %s - %s",
+            i,
+            match.get("source") or "?",
+            match["title"][:80],
+            match["link"],
+        )
+    # The rest never reach the embed, but are worth having when working out
+    # why the chosen link isn't the real source.
+    for i, match in enumerate(matches[MAX_SHOWN_MATCHES:], start=MAX_SHOWN_MATCHES + 1):
+        log.debug("  %d. [%s] %s", i, match.get("source") or "?", match["link"])
+
+
+async def search_lens(image_url: str) -> tuple[list[dict], str | None]:
+    """Returns (matches, fatal_error). No matches with no error means 'try next'."""
     log.debug("Searching Google Lens for %s", image_url)
     try:
         payload = await search_google_lens(bot.session, image_url, SERPAPI_KEY)
     except LensBadImageUrl as exc:
         log.info("Rejected image URL %s: %s", scrub(image_url), exc)
-        return None, f"Couldn't search for that image \N{EM DASH} {exc}."
+        return [], f"Couldn't search for that image \N{EM DASH} {exc}."
     except LensNoResults:
-        log.info("No matches found for %s", image_url)
-        return None, NO_MATCH_MESSAGE
+        return [], None
     except LensQuotaExceeded:
         log.warning("SerpApi quota exhausted")
-        return None, "This bot has hit its SerpApi search quota for now. Please try again later."
+        return [], "This bot has hit its SerpApi search quota for now. Please try again later."
     except LensAuthError:
         log.error("SerpApi rejected the API key")
-        return None, "This bot's search API key isn't working. Please tell the server admin."
+        return [], "This bot's search API key isn't working. Please tell the server admin."
     except LensSearchError as exc:
         log.warning("Lens search failed: %s", exc)
-        return None, f"Couldn't search for that image \N{EM DASH} {exc}."
+        return [], f"Couldn't search for that image \N{EM DASH} {exc}."
     except Exception:
         log.exception("Unexpected error during Google Lens search")
-        return None, "Something went wrong while searching for that image."
+        return [], "Something went wrong while searching for that image."
 
-    matches = payload.get("visual_matches") or []
-    embed = build_embed(payload)
-    if embed is None:
+    matches = normalize_matches(payload)
+    if not matches:
+        # Distinguish "Lens knows nothing" from "Lens knew things but none were
+        # linkable" - they look identical downstream and need different digging.
+        returned = len(payload.get("visual_matches") or [])
+        if returned:
+            log.info("Google Lens returned %d match(es), none with a usable link", returned)
+        else:
+            log.info("Google Lens found nothing for %s", image_url)
+    return matches, None
+
+
+async def search_sauce(image_url: str) -> list[dict]:
+    """Fallback lookup. Never raises - a failure here just means no fallback,
+    since the user is already being told Lens found nothing."""
+    if not SAUCENAO_API_KEY:
+        log.debug("No SAUCENAO_API_KEY set; skipping fallback")
+        return []
+
+    log.debug("Falling back to SauceNAO for %s", image_url)
+    try:
+        matches, (short_left, long_left) = await search_saucenao(
+            bot.session,
+            image_url,
+            SAUCENAO_API_KEY,
+            min_similarity=SAUCENAO_MIN_SIMILARITY,
+        )
+    except SauceQuotaExceeded as exc:
+        log.warning("SauceNAO fallback unavailable: %s", exc)
+        return []
+    except SauceAuthError:
+        log.error("SauceNAO rejected the API key; fallback disabled until fixed")
+        return []
+    except SauceError as exc:
+        log.warning("SauceNAO fallback failed: %s", exc)
+        return []
+    except Exception:
+        log.exception("Unexpected error during SauceNAO search")
+        return []
+
+    log.debug("SauceNAO quota remaining: %s short, %s long", short_left, long_left)
+    return matches
+
+
+async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | None]:
+    """Returns (embed, error_message) - exactly one of the two is set.
+
+    Google Lens first; SauceNAO only when Lens finds nothing, since Lens
+    regularly misses illustration and anime sources.
+    """
+    matches, error = await search_lens(image_url)
+    engine = "Google Lens via SerpApi"
+
+    if error:
+        return None, error
+
+    if not matches:
+        matches = await search_sauce(image_url)
+        engine = "SauceNAO"
+
+    if not matches:
         log.info("No matches found for %s", image_url)
         return None, NO_MATCH_MESSAGE
 
-    shown = top_matches(payload)
-    log.info("Found %d match(es) for %s", len(matches), image_url)
-    for i, match in enumerate(shown, start=1):
-        log.info(
-            "  %d. [%s] %s - %s",
-            i,
-            match.get("source") or "?",
-            (match.get("title") or "Untitled")[:80],
-            match.get("link") or "(no link)",
-        )
-    # The rest never reach the embed, but are worth having when working out
-    # why the chosen link isn't the real source.
-    for i, match in enumerate(matches[len(shown):], start=len(shown) + 1):
-        log.debug("  %d. [%s] %s", i, match.get("source") or "?", match.get("link") or "(no link)")
-
-    return embed, None
+    log_matches(engine, image_url, matches)
+    return build_embed(matches, engine), None
 
 
 @bot.tree.context_menu(name="Find Source")

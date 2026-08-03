@@ -95,6 +95,22 @@ def _classify_error(error: str, status: int) -> LensSearchError:
     return LensSearchError(error)
 
 
-def top_matches(payload: dict, limit: int = 4) -> list[dict]:
-    matches = payload.get("visual_matches") or []
-    return matches[:limit]
+def normalize_matches(payload: dict) -> list[dict]:
+    """Convert visual_matches to the shared match shape used by the embed:
+    title, link, source, thumbnail, similarity. Lens gives no similarity
+    score, so that stays None."""
+    matches = []
+    for match in payload.get("visual_matches") or []:
+        link = match.get("link")
+        if not link:
+            continue
+        matches.append(
+            {
+                "title": match.get("title") or "Untitled match",
+                "link": link,
+                "source": match.get("source"),
+                "thumbnail": match.get("thumbnail") or match.get("image"),
+                "similarity": None,
+            }
+        )
+    return matches
