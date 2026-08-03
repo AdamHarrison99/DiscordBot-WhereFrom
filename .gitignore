@@ -4,4 +4,6 @@ __pycache__/
 venv/
 .env
 *.log
+# Rotated log backups: wherefrom.log.1, .2, ... (*.log does not match these)
+*.log.*
 .DS_Store

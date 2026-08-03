@@ -16,7 +16,9 @@ import aiohttp
 
 SERPAPI_URL = "https://serpapi.com/search"
 
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=25)
+# The acceptance target is a reply within ~5s. SerpApi usually answers in 2-4s,
+# so this is a backstop for a hung request rather than the expected duration.
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
 class LensSearchError(Exception):

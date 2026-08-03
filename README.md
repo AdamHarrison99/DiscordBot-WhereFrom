@@ -34,6 +34,34 @@ Double-click **`startup.bat`** (Windows) or run **`./startup.sh`** (macOS/Linux/
 Either one creates the virtualenv and installs dependencies on first run, then starts
 the bot. They stop with a clear message if `.env` is missing.
 
+### Log file
+
+The bot writes to `wherefrom.log` next to `bot.py`, in addition to the terminal.
+The file is capped: once it reaches `LOG_MAX_BYTES` (default ~1 MB) it is rotated
+to `wherefrom.log.1`, the previous `.1` becomes `.2`, and so on up to
+`LOG_BACKUP_COUNT` (default 3). The oldest is discarded, so disk use is bounded
+at roughly 4 MB total.
+
+Terminal and file deliberately differ:
+
+| What | Terminal | Log file |
+| --- | --- | --- |
+| URLs | shortened for readability | **full**, including query strings |
+| discord.py internals | shown | only WARNING and above |
+| Bot activity | shown | shown |
+
+Set `LOG_FILE=none` to turn the file off — worth doing on Railway/Render, where
+the disk is wiped on restart and stdout is captured anyway. Set
+`LOG_BACKUP_COUNT=0` to empty the file on rotation rather than keeping copies.
+`LOG_MAX_BYTES` must be at least 1; `0` would disable rotation altogether and is
+ignored in favour of the default.
+
+Leaving any of these blank (or absent) uses the default — a bare `LOG_FILE=`
+line does **not** disable file logging.
+
+Log files are gitignored, but note the full Discord CDN URLs they contain include
+signed access parameters for those attachments.
+
 ### Verbose logging
 
 Pass `-v` (or `--verbose`) to either script to turn on debug logging and unmute
