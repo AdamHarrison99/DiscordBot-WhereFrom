@@ -49,3 +49,7 @@ Deploys as a background worker (no open ports needed) on Railway or Render
 free tier. `Procfile` declares `worker: python bot.py`. Set
 `DISCORD_BOT_TOKEN` and `SERPAPI_KEY` as environment variables in the
 platform's dashboard.
+
+---
+
+*This project was built with AI code development tools ([Claude Code](https://www.anthropic.com/claude-code)).*
