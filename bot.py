@@ -38,11 +38,16 @@ from chat_agent import (
     AUTO_ROUTER_MODEL,
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_MAX_TOKENS,
+    DEFAULT_MEMORY_MINUTES,
+    DEFAULT_MEMORY_TURNS,
     ChatAuthError,
+    ChatEmptyReply,
     ChatError,
     ChatNoEndpoints,
     ChatRateLimited,
+    ChatRefused,
     ChatUnavailable,
+    Conversation,
     MentionThrottle,
     ask,
     estimate_tokens,
@@ -269,6 +274,9 @@ OPENROUTER_MAX_PRICE = (
 MENTION_RATE_LIMIT = env_int("MENTION_RATE_LIMIT_PER_MINUTE", 4)
 AGENT_CONTEXT_FILE = env_str("AGENT_CONTEXT_FILE", "agent_context.md")
 MAX_CONTEXT_TOKENS = env_int("MAX_CONTEXT_TOKENS", DEFAULT_MAX_CONTEXT_TOKENS)
+# 0 turns makes every message standalone again.
+CONVERSATION_MEMORY_TURNS = env_int("CONVERSATION_MEMORY_TURNS", DEFAULT_MEMORY_TURNS, minimum=0)
+CONVERSATION_MEMORY_MINUTES = env_int("CONVERSATION_MEMORY_MINUTES", DEFAULT_MEMORY_MINUTES)
 
 MAX_SHOWN_MATCHES = 4
 
@@ -320,6 +328,9 @@ def resolve_agent_context() -> str | None:
 
 AGENT_CONTEXT = resolve_agent_context()
 mention_throttle = MentionThrottle(MENTION_RATE_LIMIT)
+conversations = Conversation(
+    CONVERSATION_MEMORY_TURNS, CONVERSATION_MEMORY_MINUTES * 60
+)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -622,9 +633,25 @@ def bot_mention_forms() -> tuple[str, ...]:
 
 
 def mentions_bot(message: discord.Message) -> bool:
-    """Discord lists the replied-to author in `mentions`, so a plain reply to one
-    of our own messages looks like a mention. Require it in the text."""
+    """Checked against the text, not `mentions` - Discord lists the replied-to
+    author there, which would make every reply look like a mention."""
     return any(form in message.content for form in bot_mention_forms())
+
+
+async def replies_to_bot(message: discord.Message) -> bool:
+    """A reply to one of our own messages continues the conversation, no @ needed."""
+    reference = message.reference
+    if reference is None or bot.user is None:
+        return False
+
+    replied = reference.resolved
+    if replied is None and reference.message_id is not None:
+        try:
+            replied = await message.channel.fetch_message(reference.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return False
+
+    return isinstance(replied, discord.Message) and replied.author.id == bot.user.id
 
 
 def strip_bot_mention(message: discord.Message) -> str:
@@ -643,8 +670,11 @@ async def safe_reply(message: discord.Message, content: str) -> None:
         log.warning("Couldn't reply in %s: %s", message.channel, exc)
 
 
-async def answer_mention(question: str, image_urls: list[str]) -> str:
-    """Returns the reply text, friendly error message included."""
+async def answer_mention(
+    question: str, image_urls: list[str], history: list[dict] | None = None
+) -> tuple[str, bool]:
+    """Returns (reply text, worth remembering). Errors are returned, not raised,
+    but never enter the conversation history."""
     try:
         reply = await ask(
             bot.session,
@@ -656,13 +686,14 @@ async def answer_mention(question: str, image_urls: list[str]) -> str:
             image_urls=image_urls,
             max_price=OPENROUTER_MAX_PRICE,
             max_context_tokens=MAX_CONTEXT_TOKENS,
+            history=history or [],
         )
     except ChatRateLimited as exc:
         log.warning("OpenRouter free-tier limit reached: %s", exc)
-        return "I've used up my free questions for now. Try again later."
+        return "I've used up my free questions for now. Try again later.", False
     except ChatAuthError:
         log.error("OpenRouter rejected the API key")
-        return "My chat API key isn't working. Please tell the server admin."
+        return "My chat API key isn't working. Please tell the server admin.", False
     except ChatNoEndpoints as exc:
         log.error(
             "Nothing matched the routing constraints (%s). OPENROUTER_MAX_PRICE=%s may "
@@ -671,16 +702,22 @@ async def answer_mention(question: str, image_urls: list[str]) -> str:
             exc,
             OPENROUTER_MAX_PRICE,
         )
-        return "My chat backend isn't configured right. Please tell the server admin."
+        return "My chat backend isn't configured right. Please tell the server admin.", False
     except ChatUnavailable as exc:
         log.info("No free model available: %s", exc)
-        return "No free model has capacity right now. Try again in a minute."
+        return "No free model has capacity right now. Try again in a minute.", False
+    except ChatRefused as exc:
+        log.info("Model declined to answer: %s", exc)
+        return "I'd rather not answer that one.", False
+    except ChatEmptyReply as exc:
+        log.warning("The model returned an empty reply (%s)", exc.detail)
+        return "The model returned an empty reply \N{EM DASH} ask me again?", False
     except ChatError as exc:
         log.warning("Chat reply failed: %s", exc)
-        return f"Couldn't answer that \N{EM DASH} {exc}."
+        return f"Couldn't answer that \N{EM DASH} {exc}.", False
     except Exception:
         log.exception("Unexpected error answering a mention")
-        return "Something went wrong answering that."
+        return "Something went wrong answering that.", False
 
     log.info(
         "Answered via %s, cost $%.6f (%d chars)",
@@ -688,14 +725,15 @@ async def answer_mention(question: str, image_urls: list[str]) -> str:
         reply.cost,
         len(reply.text),
     )
-    return reply.text[:DISCORD_MESSAGE_LIMIT]
+    return reply.text[:DISCORD_MESSAGE_LIMIT], True
 
 
 async def handle_mention(message: discord.Message) -> bool:
-    """Returns True if the mention was ours to answer."""
-    if AGENT_CONTEXT is None or message.author.bot:
+    """Returns True if this was ours to answer - an @mention, or a reply to one
+    of our own messages."""
+    if AGENT_CONTEXT is None or message.author.bot or message.mention_everyone:
         return False
-    if message.mention_everyone or not mentions_bot(message):
+    if not (mentions_bot(message) or await replies_to_bot(message)):
         return False
 
     who = describe_invocation(message.author, message.channel, message.guild)
@@ -715,9 +753,24 @@ async def handle_mention(message: discord.Message) -> bool:
     if not question:
         question = DESCRIBE_IMAGE_QUESTION
 
-    log.info("Mention from %s (%d image(s)): %s", who, len(image_urls), scrub(question))
+    # Channels are shared, so the history has to say who said what.
+    speaker = message.author.display_name
+    remembered = f"{speaker}: {question}"
+    history = conversations.history(message.channel.id)
+
+    log.info(
+        "Mention from %s (%d image(s), %d remembered): %s",
+        who,
+        len(image_urls),
+        len(history),
+        scrub(question),
+    )
     async with message.channel.typing():
-        answer = await answer_mention(question, image_urls)
+        answer, keep = await answer_mention(remembered, image_urls, history)
+
+    if keep:
+        conversations.remember(message.channel.id, "user", remembered)
+        conversations.remember(message.channel.id, "assistant", answer)
     await safe_reply(message, answer)
     return True
 

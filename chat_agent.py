@@ -28,6 +28,10 @@ DEFAULT_MAX_TOKENS = 150
 
 DEFAULT_MAX_CONTEXT_TOKENS = 2000
 
+# Kept per channel, so people can follow up without repeating themselves.
+DEFAULT_MEMORY_TURNS = 10
+DEFAULT_MEMORY_MINUTES = 30
+
 # The router spans many tokenizers, so an exact count isn't possible. Four chars
 # per token is the usual approximation and errs towards over-counting English.
 CHARS_PER_TOKEN = 4
@@ -59,6 +63,19 @@ class ChatRateLimited(ChatError):
     """Hit OpenRouter's per-minute or daily free-tier limit."""
 
 
+class ChatRefused(ChatError):
+    """The model declined, or a provider filter blanked the reply."""
+
+
+class ChatEmptyReply(ChatError):
+    """Nothing to post. `detail` carries the why for the log; str() stays clean
+    because this one is shown in the channel."""
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__("the model returned an empty reply")
+        self.detail = detail or "no finish_reason given"
+
+
 class ChatUnavailable(ChatError):
     """No free provider had capacity."""
 
@@ -76,6 +93,7 @@ class ChatReply(NamedTuple):
 
 class Prompt(NamedTuple):
     context: str
+    history: list[dict]
     question: str
     dropped_chars: int
 
@@ -84,21 +102,35 @@ def estimate_tokens(text: str) -> int:
     return -(-len(text) // CHARS_PER_TOKEN)
 
 
-def fit_to_budget(context: str, question: str, max_tokens: int) -> Prompt:
-    """Trim the question first, then the system prompt - the prompt carries the
-    bot's rules, so it's the last thing worth losing. Images aren't counted:
-    their cost is decided by the model, not by anything measurable here."""
+def _history_chars(history: Sequence[dict]) -> int:
+    return sum(len(m.get("content") or "") for m in history)
+
+
+def fit_to_budget(
+    context: str, history: Sequence[dict], question: str, max_tokens: int
+) -> Prompt:
+    """Oldest history goes first, then the current question, then the system
+    prompt - which carries the bot's rules and is the last thing worth losing.
+    Images aren't counted; only the model knows what they cost."""
+    kept = list(history)
     if max_tokens <= 0:
-        return Prompt(context, question, 0)
+        return Prompt(context, kept, question, 0)
 
     budget = max_tokens * CHARS_PER_TOKEN
-    original = len(context) + len(question)
+    original = len(context) + len(question) + _history_chars(kept)
     if original <= budget:
-        return Prompt(context, question, 0)
+        return Prompt(context, kept, question, 0)
 
-    question = question[: max(budget - len(context), MIN_QUESTION_CHARS)]
-    context = context[: max(budget - len(question), 0)]
-    return Prompt(context, question, original - len(context) - len(question))
+    fixed = len(context) + len(question)
+    running = _history_chars(kept)
+    while kept and fixed + running > budget:
+        running -= len(kept.pop(0).get("content") or "")
+
+    room = budget - running
+    question = question[: max(room - len(context), MIN_QUESTION_CHARS)]
+    context = context[: max(room - len(question), 0)]
+    total = len(context) + len(question) + running
+    return Prompt(context, kept, question, original - total)
 
 
 def load_agent_context(path: Path) -> str:
@@ -137,6 +169,39 @@ class MentionThrottle:
                 del self._hits[user_id]
 
 
+class Conversation:
+    """Rolling per-channel history, in memory only. A restart forgets everything,
+    which is fine - the free tiers wipe disk anyway."""
+
+    def __init__(self, max_turns: int, ttl_seconds: float) -> None:
+        # One turn is a user message and its reply.
+        self.max_messages = max(max_turns, 0) * 2
+        self.ttl = ttl_seconds
+        self._log: dict[int, deque[tuple[float, dict]]] = {}
+
+    def history(self, key: int, now: float | None = None) -> list[dict]:
+        now = time.monotonic() if now is None else now
+        self._expire(key, now)
+        return [message for _, message in self._log.get(key, ())]
+
+    def remember(self, key: int, role: str, content: str, now: float | None = None) -> None:
+        if not self.max_messages or not content:
+            return
+        now = time.monotonic() if now is None else now
+        self._expire(key, now)
+        entries = self._log.setdefault(key, deque(maxlen=self.max_messages))
+        entries.append((now, {"role": role, "content": content}))
+
+    def forget(self, key: int) -> bool:
+        return self._log.pop(key, None) is not None
+
+    def _expire(self, key: int, now: float) -> None:
+        """A conversation resumed hours later is a new one, not a continuation."""
+        entries = self._log.get(key)
+        if entries and now - entries[-1][0] >= self.ttl:
+            del self._log[key]
+
+
 def _user_content(question: str, image_urls: Sequence[str]) -> str | list[dict]:
     text = question[:MAX_QUESTION_CHARS]
     if not image_urls:
@@ -154,8 +219,9 @@ def build_request(
     image_urls: Sequence[str] = (),
     max_price: float | None = None,
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
+    history: Sequence[dict] = (),
 ) -> dict:
-    prompt = fit_to_budget(context, question, max_context_tokens)
+    prompt = fit_to_budget(context, history, question, max_context_tokens)
     body = {
         "model": model,
         "max_tokens": max_tokens,
@@ -164,6 +230,7 @@ def build_request(
         "reasoning": {"enabled": False},
         "messages": [
             {"role": "system", "content": prompt.context},
+            *prompt.history,
             {"role": "user", "content": _user_content(prompt.question, image_urls)},
         ],
     }
@@ -218,14 +285,40 @@ def _extract_reply(payload: dict) -> str:
     choices = payload.get("choices") or []
     if not choices:
         raise ChatError("the model returned no reply")
+
     choice = choices[0]
+    message = choice.get("message") or {}
+    finish = choice.get("finish_reason")
     # Reasoning models can fill `reasoning` and leave content empty.
-    content = ((choice.get("message") or {}).get("content") or "").strip()
+    content = (message.get("content") or "").strip()
+
     if not content:
-        raise ChatError("the model returned an empty reply")
-    if choice.get("finish_reason") == "length":
+        refusal = (message.get("refusal") or "").strip()
+        if refusal or finish in ("content_filter", "error"):
+            raise ChatRefused(refusal or f"declined ({finish})")
+        detail = f"finish_reason={finish}, native={choice.get('native_finish_reason')}"
+        # Some models reason regardless of reasoning.enabled=false and spend the
+        # whole budget doing it. Worth naming - the fix is more max_tokens.
+        if message.get("reasoning"):
+            detail += f", spent the budget reasoning ({_reasoning_tokens(payload)} tokens)"
+        raise ChatEmptyReply(detail)
+
+    if finish == "length":
         content = _drop_dangling_sentence(content)
     return content
+
+
+def _reasoning_tokens(payload: dict) -> int:
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return 0
+    details = usage.get("completion_tokens_details")
+    if not isinstance(details, dict):
+        return 0
+    try:
+        return int(details.get("reasoning_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _reported_cost(payload: dict) -> float:
@@ -249,10 +342,12 @@ async def ask(
     image_urls: Sequence[str] = (),
     max_price: float | None = None,
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
+    history: Sequence[dict] = (),
 ) -> ChatReply:
     headers = build_headers(api_key)
     body = build_request(
-        context, question, model, max_tokens, image_urls, max_price, max_context_tokens
+        context, question, model, max_tokens, image_urls, max_price,
+        max_context_tokens, history,
     )
 
     try:
