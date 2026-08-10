@@ -34,6 +34,20 @@ from sauce_search import (
     SauceQuotaExceeded,
     search_saucenao,
 )
+from chat_agent import (
+    AUTO_ROUTER_MODEL,
+    DEFAULT_MAX_CONTEXT_TOKENS,
+    DEFAULT_MAX_TOKENS,
+    ChatAuthError,
+    ChatError,
+    ChatNoEndpoints,
+    ChatRateLimited,
+    ChatUnavailable,
+    MentionThrottle,
+    ask,
+    estimate_tokens,
+    load_agent_context,
+)
 
 NO_MATCH_MESSAGE = "No reliable source found for this image."
 
@@ -241,10 +255,71 @@ SERPAPI_KEY = os.environ["SERPAPI_KEY"]
 SAUCENAO_API_KEY = env_str("SAUCENAO_API_KEY")
 SAUCENAO_MIN_SIMILARITY = env_float("SAUCENAO_MIN_SIMILARITY", DEFAULT_MIN_SIMILARITY)
 
+# Optional. Without it the bot ignores @-mentions exactly as it did before.
+OPENROUTER_API_KEY = env_str("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = env_str("OPENROUTER_MODEL", AUTO_ROUTER_MODEL)
+OPENROUTER_MAX_TOKENS = env_int("OPENROUTER_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+# Dollars per million tokens. Unset means no ceiling; too low leaves no endpoints.
+# Blank and 0 are different: 0 is a real ceiling meaning free-only.
+OPENROUTER_MAX_PRICE = (
+    env_float("OPENROUTER_MAX_PRICE", 0.0, maximum=1000.0)
+    if env_str("OPENROUTER_MAX_PRICE")
+    else None
+)
+MENTION_RATE_LIMIT = env_int("MENTION_RATE_LIMIT_PER_MINUTE", 4)
+AGENT_CONTEXT_FILE = env_str("AGENT_CONTEXT_FILE", "agent_context.md")
+MAX_CONTEXT_TOKENS = env_int("MAX_CONTEXT_TOKENS", DEFAULT_MAX_CONTEXT_TOKENS)
+
 MAX_SHOWN_MATCHES = 4
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 SAUCE_TRIGGERS = ("?sauce", "!sauce")
+
+DISCORD_MESSAGE_LIMIT = 2000
+NO_QUESTION_REPLY = (
+    "I look up where images come from. Reply to an image with `?sauce`, or use "
+    "`/sauce url:` or `/sauce file:`. Ask me a question and I'll answer that too."
+)
+RATE_LIMITED_EMOJI = "\N{HOURGLASS}"
+DESCRIBE_IMAGE_QUESTION = "What's in this image?"
+
+
+def resolve_agent_context() -> str | None:
+    """Returns the system prompt, or None if the chat feature stays off."""
+    if not OPENROUTER_API_KEY:
+        return None
+
+    path = Path(AGENT_CONTEXT_FILE)
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    try:
+        context = load_agent_context(path)
+    except ChatError as exc:
+        log.error("%s; @-mention replies disabled", exc)
+        return None
+
+    tokens = estimate_tokens(context)
+    if tokens >= MAX_CONTEXT_TOKENS:
+        log.warning(
+            "%s is ~%d tokens, at or over MAX_CONTEXT_TOKENS=%d; it will be truncated "
+            "and the bot may lose its instructions",
+            path.name,
+            tokens,
+            MAX_CONTEXT_TOKENS,
+        )
+
+    log.info(
+        "@-mention replies enabled via %s, context from %s (~%d tokens, budget %d)",
+        OPENROUTER_MODEL,
+        path,
+        tokens,
+        MAX_CONTEXT_TOKENS,
+    )
+    return context
+
+
+AGENT_CONTEXT = resolve_agent_context()
+mention_throttle = MentionThrottle(MENTION_RATE_LIMIT)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -262,7 +337,15 @@ class WhereFromBot(commands.Bot):
         await super().close()
 
 
-bot = WhereFromBot(command_prefix=commands.when_mentioned, intents=intents)
+# Match titles come from arbitrary web pages, so an "@everyone" in one would
+# otherwise ping the server. replied_user still notifies whoever asked.
+bot = WhereFromBot(
+    command_prefix=commands.when_mentioned,
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions(
+        everyone=False, users=False, roles=False, replied_user=True
+    ),
+)
 
 
 def is_image(attachment: discord.Attachment) -> bool:
@@ -467,14 +550,37 @@ async def sauce_file(interaction: discord.Interaction, file: discord.Attachment)
 bot.tree.add_command(sauce_group)
 
 
-async def handle_sauce_reply(message: discord.Message) -> None:
-    """Run a lookup when someone replies to an image with ?sauce / !sauce."""
-    if message.author.bot or not message.reference:
+@bot.tree.command(name="reloadcontext", description="Reload the chat agent's context file")
+@app_commands.default_permissions(manage_guild=True)
+async def reload_context(interaction: discord.Interaction) -> None:
+    global AGENT_CONTEXT
+    who = describe_invocation(interaction.user, interaction.channel, interaction.guild)
+    log.info("'/reloadcontext' by %s", who)
+
+    if not OPENROUTER_API_KEY:
+        await interaction.response.send_message("Chat replies are turned off.", ephemeral=True)
         return
+
+    context = resolve_agent_context()
+    if context is None:
+        await interaction.response.send_message(
+            "Couldn't reload the context file \N{EM DASH} check the logs.", ephemeral=True
+        )
+        return
+
+    AGENT_CONTEXT = context
+    await interaction.response.send_message("Context reloaded.", ephemeral=True)
+
+
+async def handle_sauce_reply(message: discord.Message) -> bool:
+    """Run a lookup when someone replies to an image with ?sauce / !sauce.
+    Returns True if this message was a trigger, handled or not."""
+    if message.author.bot or not message.reference:
+        return False
 
     content = message.content.strip().lower()
     if content not in SAUCE_TRIGGERS:
-        return
+        return False
 
     who = describe_invocation(message.author, message.channel, message.guild)
 
@@ -482,39 +588,148 @@ async def handle_sauce_reply(message: discord.Message) -> None:
     reference_id = message.reference.message_id
     if reference_id is None:
         log.info("'%s' by %s - reference has no message id (a forward?)", content, who)
-        return
+        return True
 
     try:
         replied = await message.channel.fetch_message(reference_id)
     except discord.NotFound:
         log.info("'%s' by %s - replied-to message no longer exists", content, who)
-        return
+        return True
     except discord.Forbidden:
         log.warning("'%s' by %s - missing permission to read that message", content, who)
         await message.reply("I don't have permission to read that message.")
-        return
+        return True
     except discord.HTTPException as exc:
         log.warning("'%s' by %s - couldn't fetch that message: %s", content, who, exc)
         await message.reply("Couldn't read that message just now. Try again in a moment.")
-        return
+        return True
 
     attachment = find_image_attachment(replied)
     if attachment is None:
         log.info("'%s' by %s - replied-to message had no image attachment", content, who)
         await message.reply("That message doesn't have an image attachment.")
-        return
+        return True
 
     log.info("'%s' by %s on %s", content, who, attachment.url)
     async with message.channel.typing():
         embed, error = await perform_search(attachment.url)
     await message.reply(content=error, embed=embed)
+    return True
+
+
+def bot_mention_forms() -> tuple[str, ...]:
+    return () if bot.user is None else (f"<@{bot.user.id}>", f"<@!{bot.user.id}>")
+
+
+def mentions_bot(message: discord.Message) -> bool:
+    """Discord lists the replied-to author in `mentions`, so a plain reply to one
+    of our own messages looks like a mention. Require it in the text."""
+    return any(form in message.content for form in bot_mention_forms())
+
+
+def strip_bot_mention(message: discord.Message) -> str:
+    content = message.content
+    for form in bot_mention_forms():
+        content = content.replace(form, " ")
+    return content.strip()
+
+
+async def safe_reply(message: discord.Message, content: str) -> None:
+    """The message can be deleted, or the channel locked down, between trigger
+    and answer - neither is worth a traceback."""
+    try:
+        await message.reply(content)
+    except discord.HTTPException as exc:
+        log.warning("Couldn't reply in %s: %s", message.channel, exc)
+
+
+async def answer_mention(question: str, image_urls: list[str]) -> str:
+    """Returns the reply text, friendly error message included."""
+    try:
+        reply = await ask(
+            bot.session,
+            AGENT_CONTEXT,
+            question,
+            api_key=OPENROUTER_API_KEY,
+            model=OPENROUTER_MODEL,
+            max_tokens=OPENROUTER_MAX_TOKENS,
+            image_urls=image_urls,
+            max_price=OPENROUTER_MAX_PRICE,
+            max_context_tokens=MAX_CONTEXT_TOKENS,
+        )
+    except ChatRateLimited as exc:
+        log.warning("OpenRouter free-tier limit reached: %s", exc)
+        return "I've used up my free questions for now. Try again later."
+    except ChatAuthError:
+        log.error("OpenRouter rejected the API key")
+        return "My chat API key isn't working. Please tell the server admin."
+    except ChatNoEndpoints as exc:
+        log.error(
+            "Nothing matched the routing constraints (%s). OPENROUTER_MAX_PRICE=%s may "
+            "be too low - vision models cost well over $1/M - or the account's data "
+            "policy at https://openrouter.ai/settings/privacy is too restrictive",
+            exc,
+            OPENROUTER_MAX_PRICE,
+        )
+        return "My chat backend isn't configured right. Please tell the server admin."
+    except ChatUnavailable as exc:
+        log.info("No free model available: %s", exc)
+        return "No free model has capacity right now. Try again in a minute."
+    except ChatError as exc:
+        log.warning("Chat reply failed: %s", exc)
+        return f"Couldn't answer that \N{EM DASH} {exc}."
+    except Exception:
+        log.exception("Unexpected error answering a mention")
+        return "Something went wrong answering that."
+
+    log.info(
+        "Answered via %s, cost $%.6f (%d chars)",
+        reply.model or "?",
+        reply.cost,
+        len(reply.text),
+    )
+    return reply.text[:DISCORD_MESSAGE_LIMIT]
+
+
+async def handle_mention(message: discord.Message) -> bool:
+    """Returns True if the mention was ours to answer."""
+    if AGENT_CONTEXT is None or message.author.bot:
+        return False
+    if message.mention_everyone or not mentions_bot(message):
+        return False
+
+    who = describe_invocation(message.author, message.channel, message.guild)
+    if not mention_throttle.allow(message.author.id):
+        log.info("Throttled mention from %s", who)
+        try:
+            await message.add_reaction(RATE_LIMITED_EMOJI)
+        except discord.HTTPException:
+            pass
+        return True
+
+    question = strip_bot_mention(message)
+    image_urls = [a.url for a in message.attachments if is_image(a)]
+    if not question and not image_urls:
+        await safe_reply(message, NO_QUESTION_REPLY)
+        return True
+    if not question:
+        question = DESCRIBE_IMAGE_QUESTION
+
+    log.info("Mention from %s (%d image(s)): %s", who, len(image_urls), scrub(question))
+    async with message.channel.typing():
+        answer = await answer_mention(question, image_urls)
+    await safe_reply(message, answer)
+    return True
 
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    await handle_sauce_reply(message)
+    if await handle_sauce_reply(message) or await handle_mention(message):
+        return
     # Overriding on_message replaces the default, which is what normally
-    # dispatches prefix commands - so do it here.
+    # dispatches prefix commands - so do it here. Skipped above because
+    # `when_mentioned` makes every handled mention an unknown command, which
+    # discord.py logs as an ERROR with a traceback.
     await bot.process_commands(message)
 
 

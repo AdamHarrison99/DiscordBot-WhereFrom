@@ -9,6 +9,8 @@ results (via [SerpApi](https://serpapi.com)).
 - `/sauce url:<image_url>`
 - `/sauce file:<attachment>`
 - Reply to an image message with `?sauce` or `!sauce`
+- `@WhereFrom <question>` — ask it something, optionally with an image attached
+  (off unless `OPENROUTER_API_KEY` is set; see below)
 
 ## Setup
 
@@ -43,6 +45,46 @@ free tier allows 100 searches/day and 6 per 30 seconds, well clear of SerpApi's
 100/month. Without `SAUCENAO_API_KEY` the bot just reports no match, as before.
 
 Matches below `SAUCENAO_MIN_SIMILARITY` (default 60%) are discarded as noise.
+
+## Asking it questions
+
+@-mention the bot and it answers in-channel — short replies, and it can look at any image
+attached to your message. It can't run a reverse image search from a mention; use the
+commands above for that.
+
+This is off until you set `OPENROUTER_API_KEY` (get one at
+<https://openrouter.ai/keys>). Everything else has a working default.
+
+**This costs money.** Requests go through `openrouter/auto`, which picks a model to suit
+the prompt — paid ones included. Replies land around **$0.0001–$0.0008 each**, so a busy
+day of a few hundred mentions is still well under a dollar. Each user is throttled to
+`MENTION_RATE_LIMIT_PER_MINUTE` (default 4); over that the bot reacts with an hourglass
+instead of replying. `OPENROUTER_MAX_PRICE` sets a price ceiling if you want a hard cap.
+
+**To spend nothing**, set `OPENROUTER_MODEL=openrouter/free`. Text answers work fine, but
+images don't — no free vision endpoint is reachable, so the bot reports a configuration
+error on any mention with a picture attached. That's an OpenRouter availability limit, not
+something this bot can route around.
+
+Replies are capped at `OPENROUTER_MAX_TOKENS` (default 150), which comfortably fits the
+three sentences the agent context asks for, with headroom for emoji and non-Latin scripts.
+It's a backstop, not the rule — a token cap can't count sentences, so the length
+instruction lives in `agent_context.md` where the model can follow it. If a reply does get
+cut off mid-sentence, the unfinished fragment is dropped rather than posted.
+
+Reasoning is switched off on every request. Reasoning tokens are billed out of that same
+budget, and a thinking model will happily spend all of it and return nothing at all.
+
+`MAX_CONTEXT_TOKENS` (default 2000) caps what gets *sent* — the agent context file plus the
+question. Over that, the question is trimmed first and the context second, so the bot keeps
+its instructions as long as possible. It's measured at roughly four characters per token,
+because auto-routing spans models with different tokenizers and an exact count isn't
+available. Attached images aren't counted. The startup log prints the context file's
+estimated size, and warns if it alone fills the budget.
+
+The bot's personality and rules live in `agent_context.md`, which is gitignored — copy
+`agent_context.example.md` to it and edit. Admins can reload it without a restart with
+`/reloadcontext`.
 
 ## Running it
 

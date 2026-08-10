@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 venv/
 .env
+# The live chat-agent system prompt. agent_context.example.md is the committed
+# template; the real one is local so it can be tuned without a commit.
+agent_context.md
 *.log
 # Rotated log backups: wherefrom.log.1, .2, ... (*.log does not match these)
 *.log.*
