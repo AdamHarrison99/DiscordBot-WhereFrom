@@ -119,28 +119,28 @@ def _history_chars(history: Sequence[dict]) -> int:
 def fit_to_budget(
     context: str, history: Sequence[dict], question: str, max_tokens: int
 ) -> Prompt:
-    """Oldest history goes first, then the current question, then the system
-    prompt - which carries the bot's rules and is the last thing worth losing.
-    Images aren't counted; only the model knows what they cost."""
+    """Budget covers the history and the question; oldest history goes first.
+
+    The system prompt is never trimmed - it is the bot's identity and rules, and
+    a half-truncated rulebook is worse than a shorter memory. An oversized one is
+    a config problem, flagged at startup. Images aren't counted; only the model
+    knows what they cost.
+    """
     kept = list(history)
     if max_tokens <= 0:
         return Prompt(context, kept, question, 0)
 
     budget = max_tokens * CHARS_PER_TOKEN
-    original = len(context) + len(question) + _history_chars(kept)
+    original = len(question) + _history_chars(kept)
     if original <= budget:
         return Prompt(context, kept, question, 0)
 
-    fixed = len(context) + len(question)
     running = _history_chars(kept)
-    while kept and fixed + running > budget:
+    while kept and len(question) + running > budget:
         running -= len(kept.pop(0).get("content") or "")
 
-    room = budget - running
-    question = question[: max(room - len(context), MIN_QUESTION_CHARS)]
-    context = context[: max(room - len(question), 0)]
-    total = len(context) + len(question) + running
-    return Prompt(context, kept, question, original - total)
+    question = question[: max(budget - running, MIN_QUESTION_CHARS)]
+    return Prompt(context, kept, question, original - len(question) - running)
 
 
 def load_agent_context(path: Path) -> str:

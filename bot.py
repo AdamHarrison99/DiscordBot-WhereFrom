@@ -311,16 +311,18 @@ def resolve_agent_context() -> str | None:
 
     tokens = estimate_tokens(context)
     if tokens >= MAX_CONTEXT_TOKENS:
+        # Never trimmed, so an oversized one is a bill, not a broken prompt.
         log.warning(
-            "%s is ~%d tokens, at or over MAX_CONTEXT_TOKENS=%d; it will be truncated "
-            "and the bot may lose its instructions",
+            "%s is ~%d tokens, larger than MAX_CONTEXT_TOKENS=%d. It is always sent in "
+            "full, so every reply pays for it and little history will fit alongside",
             path.name,
             tokens,
             MAX_CONTEXT_TOKENS,
         )
 
     log.info(
-        "@-mention replies enabled via %s, context from %s (~%d tokens, budget %d)",
+        "@-mention replies enabled via %s, context from %s (~%d tokens, plus a %d budget "
+        "for history and the question)",
         OPENROUTER_MODEL,
         path,
         tokens,
@@ -571,26 +573,19 @@ async def sauce_file(interaction: discord.Interaction, file: discord.Attachment)
 bot.tree.add_command(sauce_group)
 
 
-@bot.tree.command(name="reloadcontext", description="Reload the chat agent's context file")
-@app_commands.default_permissions(manage_guild=True)
-async def reload_context(interaction: discord.Interaction) -> None:
-    global AGENT_CONTEXT
+@bot.tree.command(name="forget", description="Make the bot forget this channel's conversation")
+async def forget(interaction: discord.Interaction) -> None:
     who = describe_invocation(interaction.user, interaction.channel, interaction.guild)
-    log.info("'/reloadcontext' by %s", who)
+    log.info("'/forget' by %s", who)
 
-    if not OPENROUTER_API_KEY:
-        await interaction.response.send_message("Chat replies are turned off.", ephemeral=True)
+    if interaction.channel is None:
+        await interaction.response.send_message("Nothing to forget here.", ephemeral=True)
         return
 
-    context = resolve_agent_context()
-    if context is None:
-        await interaction.response.send_message(
-            "Couldn't reload the context file \N{EM DASH} check the logs.", ephemeral=True
-        )
-        return
-
-    AGENT_CONTEXT = context
-    await interaction.response.send_message("Context reloaded.", ephemeral=True)
+    cleared = conversations.forget(interaction.channel.id)
+    await interaction.response.send_message(
+        "Forgotten \N{EM DASH} starting fresh." if cleared else "Nothing to forget yet."
+    )
 
 
 async def handle_sauce_reply(message: discord.Message) -> bool:

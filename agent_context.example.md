@@ -1,7 +1,7 @@
 # WhereFrom — chat agent context
 
 Everything below is sent to the model as the system prompt whenever someone @-mentions the
-bot. Edit it freely; the bot re-reads this file on start (and on `/reloadcontext`). Lines
+bot. Edit it freely; the bot reads this file at startup, so restart it to pick up changes. Lines
 starting with `#` at the very top of the file are kept — the model sees this verbatim.
 
 ---
