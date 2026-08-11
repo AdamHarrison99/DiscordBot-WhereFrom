@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import NamedTuple
+
+ToolRunner = Callable[[dict], Awaitable[str]]
 
 import aiohttp
 
@@ -21,6 +23,12 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 MAX_QUESTION_CHARS = 1000
 MAX_IMAGES = 4
+
+# One round is enough for "search, then answer", and each round is a paid call.
+MAX_TOOL_ROUNDS = 1
+
+# Tool output is appended after the budget has been applied, so cap it here.
+MAX_TOOL_RESULT_CHARS = 2000
 
 # Three sentences is ~70 tokens; the rest is headroom for emoji and CJK, which
 # cost several tokens each. The length rule itself lives in the agent context.
@@ -89,6 +97,8 @@ class ChatReply(NamedTuple):
     text: str
     model: str | None
     cost: float
+    # Tuple, not list: a NamedTuple default is shared by every instance.
+    tools_used: tuple[str, ...] = ()
 
 
 class Prompt(NamedTuple):
@@ -331,25 +341,7 @@ def _reported_cost(payload: dict) -> float:
         return 0.0
 
 
-async def ask(
-    session: aiohttp.ClientSession,
-    context: str,
-    question: str,
-    *,
-    api_key: str,
-    model: str = AUTO_ROUTER_MODEL,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-    image_urls: Sequence[str] = (),
-    max_price: float | None = None,
-    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
-    history: Sequence[dict] = (),
-) -> ChatReply:
-    headers = build_headers(api_key)
-    body = build_request(
-        context, question, model, max_tokens, image_urls, max_price,
-        max_context_tokens, history,
-    )
-
+async def _post(session: aiohttp.ClientSession, body: dict, headers: dict) -> dict:
     try:
         async with session.post(
             OPENROUTER_URL, json=body, headers=headers, timeout=REQUEST_TIMEOUT
@@ -363,6 +355,61 @@ async def ask(
 
     if not isinstance(payload, dict):
         raise ChatError("OpenRouter returned an unexpected response")
-
     _raise_for_status(status, payload)
-    return ChatReply(_extract_reply(payload), payload.get("model"), _reported_cost(payload))
+    return payload
+
+
+def _tool_calls(payload: dict) -> list[dict]:
+    choices = payload.get("choices") or []
+    if not choices:
+        return []
+    calls = (choices[0].get("message") or {}).get("tool_calls")
+    return calls if isinstance(calls, list) else []
+
+
+async def ask(
+    session: aiohttp.ClientSession,
+    context: str,
+    question: str,
+    *,
+    api_key: str,
+    model: str = AUTO_ROUTER_MODEL,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    image_urls: Sequence[str] = (),
+    max_price: float | None = None,
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
+    history: Sequence[dict] = (),
+    tools: Sequence[dict] = (),
+    tool_runner: ToolRunner | None = None,
+    max_tool_rounds: int = MAX_TOOL_ROUNDS,
+) -> ChatReply:
+    headers = build_headers(api_key)
+    body = build_request(
+        context, question, model, max_tokens, image_urls, max_price,
+        max_context_tokens, history,
+    )
+    if tools and tool_runner:
+        body["tools"] = list(tools)
+
+    cost = 0.0
+    used_tools: list[str] = []
+    for remaining in range(max_tool_rounds, -1, -1):
+        payload = await _post(session, body, headers)
+        cost += _reported_cost(payload)
+
+        calls = _tool_calls(payload) if tool_runner else []
+        if not calls or not remaining:
+            break
+
+        # The assistant turn asking for the call has to go back verbatim.
+        body["messages"].append((payload["choices"][0].get("message") or {}))
+        for call in calls:
+            name = ((call.get("function") or {}).get("name")) or "?"
+            used_tools.append(name)
+            body["messages"].append({
+                "role": "tool",
+                "tool_call_id": call.get("id"),
+                "content": (await tool_runner(call))[:MAX_TOOL_RESULT_CHARS],
+            })
+
+    return ChatReply(_extract_reply(payload), payload.get("model"), cost, tuple(used_tools))

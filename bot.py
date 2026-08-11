@@ -263,6 +263,9 @@ SAUCENAO_MIN_SIMILARITY = env_float("SAUCENAO_MIN_SIMILARITY", DEFAULT_MIN_SIMIL
 # Optional. Without it the bot ignores @-mentions exactly as it did before.
 OPENROUTER_API_KEY = env_str("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = env_str("OPENROUTER_MODEL", AUTO_ROUTER_MODEL)
+# Per-kind overrides. Unset falls back to OPENROUTER_MODEL, i.e. auto routing.
+OPENROUTER_TEXT_MODEL = env_str("OPENROUTER_TEXT_MODEL", OPENROUTER_MODEL)
+OPENROUTER_IMAGE_MODEL = env_str("OPENROUTER_IMAGE_MODEL", OPENROUTER_MODEL)
 OPENROUTER_MAX_TOKENS = env_int("OPENROUTER_MAX_TOKENS", DEFAULT_MAX_TOKENS)
 # Dollars per million tokens. Unset means no ceiling; too low leaves no endpoints.
 # Blank and 0 are different: 0 is a real ceiling meaning free-only.
@@ -491,27 +494,34 @@ async def search_sauce(image_url: str) -> list[dict]:
     return matches
 
 
-async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | None]:
-    """Returns (embed, error_message) - exactly one of the two is set.
-
-    Google Lens first; SauceNAO only when Lens finds nothing, since Lens
-    regularly misses illustration and anime sources.
-    """
+async def lookup_source(image_url: str) -> tuple[list[dict], str, str | None]:
+    """Returns (matches, engine, error). Google Lens first; SauceNAO only when
+    Lens finds nothing, since Lens regularly misses illustration and anime
+    sources."""
     matches, error = await search_lens(image_url)
     engine = "Google Lens via SerpApi"
 
     if error:
-        return None, error
+        return [], engine, error
 
     if not matches:
         matches = await search_sauce(image_url)
         engine = "SauceNAO"
 
-    if not matches:
+    if matches:
+        log_matches(engine, image_url, matches)
+    else:
         log.info("No matches found for %s", image_url)
-        return None, NO_MATCH_MESSAGE
+    return matches, engine, None
 
-    log_matches(engine, image_url, matches)
+
+async def perform_search(image_url: str) -> tuple[discord.Embed | None, str | None]:
+    """Returns (embed, error_message) - exactly one of the two is set."""
+    matches, engine, error = await lookup_source(image_url)
+    if error:
+        return None, error
+    if not matches:
+        return None, NO_MATCH_MESSAGE
     return build_embed(matches, engine), None
 
 
@@ -638,20 +648,26 @@ def mentions_bot(message: discord.Message) -> bool:
     return any(form in message.content for form in bot_mention_forms())
 
 
-async def replies_to_bot(message: discord.Message) -> bool:
-    """A reply to one of our own messages continues the conversation, no @ needed."""
+async def resolve_reference(message: discord.Message) -> discord.Message | None:
+    """The message being replied to. Discord usually inlines it; fetch covers the
+    rest, including messages older than this process."""
     reference = message.reference
-    if reference is None or bot.user is None:
-        return False
+    if reference is None:
+        return None
 
     replied = reference.resolved
-    if replied is None and reference.message_id is not None:
-        try:
-            replied = await message.channel.fetch_message(reference.message_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            return False
+    if isinstance(replied, discord.Message):
+        return replied
+    if reference.message_id is None:
+        return None
+    try:
+        return await message.channel.fetch_message(reference.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
 
-    return isinstance(replied, discord.Message) and replied.author.id == bot.user.id
+
+def image_urls_in(message: discord.Message) -> list[str]:
+    return [a.url for a in message.attachments if is_image(a)]
 
 
 def strip_bot_mention(message: discord.Message) -> str:
@@ -670,23 +686,100 @@ async def safe_reply(message: discord.Message, content: str) -> None:
         log.warning("Couldn't reply in %s: %s", message.channel, exc)
 
 
+FIND_SOURCE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "find_image_source",
+        "description": (
+            "Reverse image search the image in this message to find where it came "
+            "from. Call this when someone asks where an image is from, who made it, "
+            "what anime or artist it is, or for its source or sauce. Returns the "
+            "pages the image was found on."
+        ),
+        # No parameters on purpose: the bot searches the image it already has,
+        # so the model can't point the search at a URL of its own choosing.
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+
+def describe_matches(matches: list[dict], engine: str) -> str:
+    lines = [f"Reverse image search results from {engine}:"]
+    for match in matches[:MAX_SHOWN_MATCHES]:
+        parts = [match["title"][:120]]
+        if match.get("source"):
+            parts.append(f"on {match['source']}")
+        parts.append(match["link"])
+        if match.get("similarity") is not None:
+            parts.append(f"{match['similarity']:.0f}% similar")
+        lines.append("- " + " | ".join(parts))
+    lines.append(
+        "Quote the first link in full in your reply. Don't invent anything not listed."
+    )
+    return "\n".join(lines)
+
+
+class SourceFinder:
+    """Runs the reverse search for the agent, once per message: SerpApi's free
+    tier is 100 a month and the model decides when to spend one."""
+
+    def __init__(self, image_url: str, who: str) -> None:
+        self.image_url = image_url
+        self.who = who
+        self.top_link: str | None = None
+        self._spent = False
+
+    async def __call__(self, call: dict) -> str:
+        name = (call.get("function") or {}).get("name")
+        if name != "find_image_source":
+            return f"No such tool: {name}."
+        if self._spent:
+            return "Already searched this image; use the results above."
+
+        self._spent = True
+        log.info("Agent called find_image_source for %s (asked by %s)", self.image_url, self.who)
+        try:
+            matches, engine, error = await lookup_source(self.image_url)
+        except Exception:
+            log.exception("find_image_source failed")
+            return "The search failed. Tell the user it didn't work."
+
+        if error:
+            return f"The search couldn't run: {error}"
+        if not matches:
+            return "No source found for this image. Tell the user that plainly."
+
+        self.top_link = matches[0]["link"]
+        return describe_matches(matches, engine)
+
+
 async def answer_mention(
-    question: str, image_urls: list[str], history: list[dict] | None = None
+    question: str,
+    image_urls: list[str],
+    history: list[dict] | None = None,
+    who: str = "someone",
 ) -> tuple[str, bool]:
     """Returns (reply text, worth remembering). Errors are returned, not raised,
     but never enter the conversation history."""
+    model = OPENROUTER_IMAGE_MODEL if image_urls else OPENROUTER_TEXT_MODEL
+    # Only offered when there's actually an image to search.
+    tools = [FIND_SOURCE_TOOL] if image_urls else []
+    finder = SourceFinder(image_urls[0], who) if image_urls else None
+
     try:
         reply = await ask(
             bot.session,
             AGENT_CONTEXT,
             question,
             api_key=OPENROUTER_API_KEY,
-            model=OPENROUTER_MODEL,
+            model=model,
             max_tokens=OPENROUTER_MAX_TOKENS,
             image_urls=image_urls,
             max_price=OPENROUTER_MAX_PRICE,
             max_context_tokens=MAX_CONTEXT_TOKENS,
             history=history or [],
+            tools=tools,
+            tool_runner=finder,
         )
     except ChatRateLimited as exc:
         log.warning("OpenRouter free-tier limit reached: %s", exc)
@@ -720,12 +813,19 @@ async def answer_mention(
         return "Something went wrong answering that.", False
 
     log.info(
-        "Answered via %s, cost $%.6f (%d chars)",
+        "Answered via %s, cost $%.6f (%d chars)%s",
         reply.model or "?",
         reply.cost,
         len(reply.text),
+        f", tools: {', '.join(reply.tools_used)}" if reply.tools_used else "",
     )
-    return reply.text[:DISCORD_MESSAGE_LIMIT], True
+
+    text = reply.text
+    # The whole point of a source lookup is the link. Models paraphrase it away
+    # ("it's from Wikipedia"), so put it back rather than hope the prompt holds.
+    if finder and finder.top_link and finder.top_link not in text:
+        text = f"{text}\n{finder.top_link}"
+    return text[:DISCORD_MESSAGE_LIMIT], True
 
 
 async def handle_mention(message: discord.Message) -> bool:
@@ -733,7 +833,12 @@ async def handle_mention(message: discord.Message) -> bool:
     of our own messages."""
     if AGENT_CONTEXT is None or message.author.bot or message.mention_everyone:
         return False
-    if not (mentions_bot(message) or await replies_to_bot(message)):
+
+    replied = await resolve_reference(message)
+    replying_to_bot = (
+        replied is not None and bot.user is not None and replied.author.id == bot.user.id
+    )
+    if not (mentions_bot(message) or replying_to_bot):
         return False
 
     who = describe_invocation(message.author, message.channel, message.guild)
@@ -746,7 +851,10 @@ async def handle_mention(message: discord.Message) -> bool:
         return True
 
     question = strip_bot_mention(message)
-    image_urls = [a.url for a in message.attachments if is_image(a)]
+    # "@bot what is this" as a reply means the image one message up, not this one.
+    image_urls = image_urls_in(message)
+    if replied is not None:
+        image_urls += [u for u in image_urls_in(replied) if u not in image_urls]
     if not question and not image_urls:
         await safe_reply(message, NO_QUESTION_REPLY)
         return True
@@ -766,7 +874,7 @@ async def handle_mention(message: discord.Message) -> bool:
         scrub(question),
     )
     async with message.channel.typing():
-        answer, keep = await answer_mention(remembered, image_urls, history)
+        answer, keep = await answer_mention(remembered, image_urls, history, who)
 
     if keep:
         conversations.remember(message.channel.id, "user", remembered)
