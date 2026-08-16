@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -326,6 +327,9 @@ PAGE_READ_PER_MESSAGE = env_int("PAGE_READ_PER_MESSAGE", 2, minimum=0)
 AGENT_TOOL_ROUNDS = env_int("AGENT_TOOL_ROUNDS", 2)
 
 MAX_SHOWN_MATCHES = 4
+
+# Model-written, so it gets the same treatment as any other untrusted string.
+TOOL_ARG_LOG_CHARS = 300
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 SAUCE_TRIGGERS = ("?sauce", "!sauce")
@@ -860,7 +864,7 @@ class SourceFinder:
             return "Already searched this image; use the results above."
 
         self._spent = True
-        log.info("Agent called find_image_source for %s (asked by %s)", self.image_url, self.who)
+        log.info("Reverse searching %s", self.image_url)
         try:
             matches, engine, error = await lookup_source(self.image_url)
         except Exception:
@@ -900,10 +904,10 @@ def describe_web_results(query: str, answer: str, results: list[dict]) -> str:
 async def lookup_web(query: str, who: str) -> str:
     """Returns what the model should see - the results, or why there are none.
     Never raises: a failed lookup is an answer, not an exception."""
-    log.info("Agent called search_web for %r (asked by %s)", scrub(query, 100), who)
     try:
         payload = await search_web(bot.session, query, SERPAPI_KEY, WEB_SEARCH_RESULTS)
     except WebNoResults:
+        log.info("Web search for %r found nothing", scrub(query, 100))
         return "The search returned nothing. Tell the user you couldn't find anything."
     except WebBadQuery:
         return "That search had no query in it."
@@ -925,7 +929,14 @@ async def lookup_web(query: str, who: str) -> str:
     if not results and not answer:
         return "No results. Tell the user you couldn't find anything."
 
-    log.debug("Web search returned %d result(s)%s", len(results), ", plus an answer box" if answer else "")
+    log.info(
+        "Web search for %r: %d result(s)%s",
+        scrub(query, 100),
+        len(results),
+        ", plus an answer box" if answer else "",
+    )
+    for result in results[:WEB_SEARCH_RESULTS]:
+        log.debug("  %s - %s", result["title"][:70], result["link"])
     return describe_web_results(query, answer, results)
 
 
@@ -952,24 +963,27 @@ def describe_page(page: dict) -> str:
 async def read_link(url: str, who: str) -> tuple[str, str]:
     """Returns (what the model should see, an image URL worth reverse searching).
     Never raises - a page that won't open is an answer, not an exception."""
-    log.info("Agent called read_page for %s (asked by %s)", scrub(url, 200), who)
     try:
         page = await fetch_page(bot.session, url, PAGE_READ_MAX_CHARS)
     except PageIsImage as exc:
+        log.info("%s is an image; handing it to the reverse image search", scrub(url, 200))
         return (
             "That link is an image, not a page. Use find_image_source if they want to "
             "know where it came from.",
             exc.url,
         )
     except PageNotFound:
+        log.info("read_page: %s is dead", scrub(url, 200))
         return "That link is dead - there's nothing there.", ""
-    except PageBlocked:
+    except PageBlocked as exc:
+        log.info("read_page: %s refused us (%s)", scrub(url, 200), exc)
         return (
             "The site refused to let me read that - it's behind a login or blocking "
             "bots. Tell them that plainly.",
             "",
         )
     except (PageBadUrl, PageNotText) as exc:
+        log.info("read_page: won't read %s - %s", scrub(url, 200), exc)
         return f"Can't read that: {exc}.", ""
     except PageError as exc:
         log.info("read_page failed for %s: %s", scrub(url, 200), exc)
@@ -979,11 +993,15 @@ async def read_link(url: str, who: str) -> tuple[str, str]:
         return "Reading that page didn't work.", ""
 
     if not (page["text"] or page["title"] or page["description"]):
+        log.info("read_page: nothing readable at %s", scrub(url, 200))
         return "That page had no readable text on it - it's all script or images.", page["image"]
 
-    log.debug(
-        "Read %d chars from %s%s", len(page["text"]), page["url"],
+    log.info(
+        "Read %d chars from %s%s%s",
+        len(page["text"]),
+        page["url"],
         " (truncated)" if page["truncated"] else "",
+        f", image {page['image']}" if page["image"] else "",
     )
     return describe_page(page), page["image"]
 
@@ -1037,30 +1055,59 @@ class AgentTools:
 
     async def __call__(self, call: dict) -> str:
         function = call.get("function") or {}
-        name = function.get("name")
+        name = function.get("name") or "?"
+        arguments = function.get("arguments") or ""
+        # Verbatim, so the log shows what the model actually asked for.
+        log.info("Tool call from %s: %s(%s)", self.who, name, scrub(arguments, TOOL_ARG_LOG_CHARS))
+
+        started = time.perf_counter()
         if name == "find_image_source":
-            return await self._find_source(call)
-        if name == "search_web":
-            return await self._web_search(function.get("arguments"))
-        if name == "read_page":
-            return await self._read_page(function.get("arguments"))
-        return f"No such tool: {name}."
+            result = await self._find_source(call)
+        elif name == "search_web":
+            result = await self._web_search(arguments)
+        elif name == "read_page":
+            result = await self._read_page(arguments)
+        else:
+            result = self._refuse(name, "no tool by that name", f"No such tool: {name}.")
+
+        log.info(
+            "Tool %s returned %d chars in %.1fs", name, len(result), time.perf_counter() - started
+        )
+        return result
+
+    def _refuse(self, name: str, reason: str, message: str) -> str:
+        """Log why a guard said no; a silent refusal is invisible in the log."""
+        log.info("Tool %s refused for %s: %s", name, self.who, reason)
+        return message
 
     async def _find_source(self, call: dict) -> str:
         if self.finder is None and self.discovered_image:
+            log.info("Searching the image found on the page the agent read")
             self.finder = SourceFinder(self.discovered_image, self.who)
         if self.finder is None:
-            return "There's no image to search here. Ask them to post one, or read the link first."
+            return self._refuse(
+                "find_image_source",
+                "no image in this message",
+                "There's no image to search here. Ask them to post one, or read the link first.",
+            )
         return await self.finder(call)
 
     async def _read_page(self, arguments: str | None) -> str:
         if not self.page_reading_on:
-            return "Reading links is turned off. Say you can't open it."
+            return self._refuse(
+                "read_page", "disabled by config", "Reading links is turned off. Say you can't open it."
+            )
         if self.pages_read >= PAGE_READ_PER_MESSAGE:
-            return "That's as many links as I can open for one message; answer from what you have."
+            return self._refuse(
+                "read_page",
+                f"already read {self.pages_read} page(s) this message",
+                "That's as many links as I can open for one message; answer from what you have.",
+            )
         url = tool_argument(arguments, "url")
         if not url:
-            return "That call had no link in it. Say which link you meant."
+            return self._refuse(
+                "read_page", "no url in the arguments", "That call had no link in it. Say which link you meant."
+            )
 
         self.pages_read += 1
         text, image = await read_link(url, self.who)
@@ -1070,21 +1117,35 @@ class AgentTools:
 
     async def _web_search(self, arguments: str | None) -> str:
         if not (WEB_SEARCH_ENABLED and WEB_SEARCH_DAILY_LIMIT):
-            return "Web search is turned off. Answer from what you know, or say you don't."
+            return self._refuse(
+                "search_web",
+                "disabled by config",
+                "Web search is turned off. Answer from what you know, or say you don't.",
+            )
         if self.web_spent:
-            return "Already searched the web for this message; use those results."
+            return self._refuse(
+                "search_web",
+                "already searched once this message",
+                "Already searched the web for this message; use those results.",
+            )
         query = tool_argument(arguments, "query")
         if not query:
-            return "That call had no query in it. Say what you wanted to search for."
+            return self._refuse(
+                "search_web",
+                "no query in the arguments",
+                "That call had no query in it. Say what you wanted to search for.",
+            )
         if not web_budget.spend():
             log.warning(
-                "Agent web search refused: daily limit of %d already spent",
+                "Tool search_web refused for %s: daily limit of %d already spent",
+                self.who,
                 web_budget.limit,
             )
             return (
                 "The daily search allowance is used up. Tell the user you can't look "
                 "things up until tomorrow."
             )
+        log.info("SerpApi web search %d of %d today", web_budget.used, web_budget.limit)
         self.web_spent = True
         return await lookup_web(query, self.who)
 
