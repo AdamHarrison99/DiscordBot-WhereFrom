@@ -28,7 +28,8 @@ MAX_IMAGES = 4
 MAX_TOOL_ROUNDS = 1
 
 # Tool output is appended after the budget has been applied, so cap it here.
-MAX_TOOL_RESULT_CHARS = 2000
+# Fits a page read at ~1000 tokens on the follow-up call.
+MAX_TOOL_RESULT_CHARS = 4000
 
 # Three sentences is ~70 tokens; the rest is headroom for emoji and CJK, which
 # cost several tokens each. The length rule itself lives in the agent context.
@@ -411,5 +412,10 @@ async def ask(
                 "tool_call_id": call.get("id"),
                 "content": (await tool_runner(call))[:MAX_TOOL_RESULT_CHARS],
             })
+
+        # The next round is the last, so forbid another tool call: a model that
+        # spends it asking for one returns empty content and nothing to post.
+        if remaining == 1:
+            body["tool_choice"] = "none"
 
     return ChatReply(_extract_reply(payload), payload.get("model"), cost, tuple(used_tools))
