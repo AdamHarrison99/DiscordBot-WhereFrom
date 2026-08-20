@@ -78,6 +78,9 @@ A background worker with no open ports — `Procfile` declares `worker: python b
 Set the keys as environment variables in your platform's dashboard instead of shipping
 a `.env`, and set `LOG_FILE=none` where the disk is wiped on restart.
 
+`agentic/` is developer documentation: why the code is shaped the way it is, the API
+quirks behind it, and offline check scripts that run without any keys.
+
 ---
 
 *This project was built with AI code development tools ([Claude Code](https://www.anthropic.com/claude-code)).*
