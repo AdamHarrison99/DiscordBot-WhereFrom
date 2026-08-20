@@ -5,4 +5,4 @@ starting. `../CLAUDE.md` is the technical handoff; these are the working convent
 around it.
 
 - [Confirm before git commit or push](confirm-before-git-write.md) — never write to git history unprompted; ask first
-- [WhereFrom project](wherefrom-project.md) — layout, what belongs in `agentic/`, and the README disclosure line
+- [WhereFrom project](wherefrom-project.md) — layout, belongs in `agentic/`, what stays out of the published repo, and the README disclosure line
