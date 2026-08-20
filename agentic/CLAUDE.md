@@ -9,6 +9,7 @@ than duplicating it here. This file is what the README can't tell you.
 ## Layout
 
 - Bot code sits at the repo root; agent-facing docs and checks live in `agentic/`.
+- `agentic/memory/` holds the working conventions — read `memory/MEMORY.md` first.
 - A `CLAUDE.md` in a subfolder doesn't load automatically, so this one is imported by a
   stub above the repo root. Keep the stub if you have one.
 - GitHub: <https://github.com/AdamHarrison99/DiscordBot-WhereFrom> (public)
@@ -178,6 +179,9 @@ behind it, not the runner itself.
 - `.env.example` and `agent_context.example.md` are committed templates for gitignored
   files. Add new vars to the example with a comment explaining what each one buys you.
   `agent_context.md` is deliberately *not* a copy of its example — don't sync them.
+- **Memories go in `agentic/memory/`**, never in a per-session store outside the repo —
+  one file per fact, linked from `memory/MEMORY.md`. They're published like everything
+  else here, so write the rule, not who asked for it or when.
 - Keep this document lean. Information has to earn its place: no change logs, no reasoning
   narratives, no restating the README or the code.
 
