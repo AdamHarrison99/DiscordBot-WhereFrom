@@ -187,8 +187,11 @@ behind it, not the runner itself.
   list and appends `FREE_ROUTER_MODEL` last, so the final attempt costs nothing;
   `model_field` then sends `model` for one id and `models` for several. Verified live
   2026-08-22: a `models` array whose first entry is rate-limited is served by the second.
-  Two limits — **an invalid model id is a hard 400, not a skipped entry**, and `route:
-  "fallback"` is neither needed nor helpful (it 429'd where the bare array succeeded).
+  Three limits — **the array takes at most 3 ids** (`MAX_FALLBACK_MODELS`; a fourth is a
+  hard 400, and the appended free router counts toward it, so `env_models` truncates and
+  says which ids it dropped), **an invalid model id is a hard 400, not a skipped entry**,
+  and `route: "fallback"` is neither needed nor helpful (it 429'd where the bare array
+  succeeded).
   **`OPENROUTER_IMAGE_MODEL` is the exception** (`free_last=False`): a router with no vision
   endpoint can only turn a busy paid model into `ChatNoEndpoints`, which reads to the user
   as "the admin misconfigured me". It is dropped from that chain even when inherited from

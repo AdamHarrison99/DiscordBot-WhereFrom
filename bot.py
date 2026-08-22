@@ -73,6 +73,7 @@ from chat_agent import (
     ChatNoEndpoints,
     ChatRateLimited,
     ChatRefused,
+    MAX_FALLBACK_MODELS,
     ChatUnavailable,
     Conversation,
     MentionThrottle,
@@ -174,7 +175,13 @@ def env_models(name: str, default: str = "", free_last: bool = True) -> tuple[st
     upstream into "your backend is misconfigured"."""
     ids = [m.strip() for m in env_str(name, default).split(",") if m.strip()]
     ids = tuple(m for m in dict.fromkeys(ids) if m != FREE_ROUTER_MODEL)
-    return ids + (FREE_ROUTER_MODEL,) if free_last or not ids else ids
+    ids = ids + (FREE_ROUTER_MODEL,) if free_last or not ids else ids
+    if len(ids) > MAX_FALLBACK_MODELS:
+        log.warning(
+            "%s resolves to %d models but OpenRouter takes %d, so %s will never be tried",
+            name, len(ids), MAX_FALLBACK_MODELS, ", ".join(ids[MAX_FALLBACK_MODELS:])
+        )
+    return ids[:MAX_FALLBACK_MODELS]
 
 
 def env_float(name: str, default: float, minimum: float = 0.0, maximum: float = 100.0) -> float:

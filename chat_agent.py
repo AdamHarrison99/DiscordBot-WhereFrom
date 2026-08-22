@@ -222,12 +222,16 @@ def _user_content(question: str, image_urls: Sequence[str]) -> str | list[dict]:
     ]
 
 
+# OpenRouter rejects a longer array outright, so the tail is dropped, not sent.
+MAX_FALLBACK_MODELS = 3
+
+
 def model_field(model: str | Sequence[str]) -> dict:
     """One id sends `model`; several send `models`, which OpenRouter tries in
     order, moving on when one errors or is rate-limited."""
     ids = [model] if isinstance(model, str) else [m for m in model if m]
     # An empty list would send `models: []`, which is a request nothing can serve.
-    ids = ids or [FREE_ROUTER_MODEL]
+    ids = (ids or [FREE_ROUTER_MODEL])[:MAX_FALLBACK_MODELS]
     return {"model": ids[0]} if len(ids) == 1 else {"models": ids}
 
 

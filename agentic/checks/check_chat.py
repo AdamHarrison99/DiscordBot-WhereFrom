@@ -32,6 +32,11 @@ check("a one-entry chain is a plain model",
 check("model_field drops blanks", ca.model_field(["a/one", "", "b/two"])["models"] == ["a/one", "b/two"])
 check("an empty chain falls back rather than sending models: []",
       ca.model_field([]) == {"model": ca.FREE_ROUTER_MODEL})
+# OpenRouter 400s on a fourth entry, so the cap binds where the body is built.
+check("model_field caps the array at three",
+      ca.model_field(["a/1", "b/2", "c/3", "d/4"]) == {"models": ["a/1", "b/2", "c/3"]})
+check("the cap keeps the order given",
+      ca.model_field(["a/1", "b/2", "c/3", "d/4"])["models"][0] == "a/1")
 check("system prompt first", body["messages"][0]["role"] == "system")
 long_q = "x" * 5000
 check("question capped", len(ca.build_request("c", long_q, ca.AUTO_ROUTER_MODEL, 300)["messages"][1]["content"]) == ca.MAX_QUESTION_CHARS)

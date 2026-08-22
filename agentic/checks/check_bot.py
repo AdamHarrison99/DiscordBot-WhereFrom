@@ -312,7 +312,12 @@ check("one set, one blank",
 
 # --- fallback chains ---
 check("a comma-separated list is a chain in order",
-      reload_models(text="a/one, b/two ,c/three")[0] == ("a/one", "b/two", "c/three", FREE))
+      reload_models(text="a/one, b/two")[0] == ("a/one", "b/two", FREE))
+# OpenRouter takes three, and the appended free router is one of them.
+check("a chain at the cap drops the free router",
+      reload_models(text="a/one, b/two ,c/three")[0] == ("a/one", "b/two", "c/three"))
+check("a chain past the cap keeps the order given",
+      reload_models(text="a/1,b/2,c/3,d/4")[0] == ("a/1", "b/2", "c/3"))
 check("the free router is always last",
       reload_models(text="a/one")[0][-1] == FREE)
 check("the free router isn't repeated when listed",
