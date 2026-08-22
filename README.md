@@ -35,6 +35,21 @@ Reply to one of its messages and it keeps talking — no @ needed. Post an image
 it goes to the reverse image search, as does the main picture on any page it reads, so
 "where's the photo on this page from?" works.
 
+### Speaking without being asked
+
+Off by default. Enabled per channel, the bot reads along and speaks when it judges it has
+something to add — an unanswered question, an image nobody has sourced, or someone talking
+about it. A cheap model scores each lull 0-100 first, so most conversations cost nothing
+and get nothing.
+
+Turning it on sends unaddressed messages to OpenRouter, which is a real change: until now
+only messages aimed at the bot ever left the machine. Nothing anyone says is written to
+the log or to disk either way. Set `AMBIENT_MODE=observe` to watch what it *would* say for
+a few days before letting it post. DMs are excluded. It reads text and
+images only — video, audio and documents are ignored.
+
+See the `AMBIENT_` block in `.env.example`.
+
 ## Quick start
 
 You need Python 3.11+, a Discord bot token, and a SerpApi key. Both other keys are

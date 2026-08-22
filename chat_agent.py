@@ -222,10 +222,19 @@ def _user_content(question: str, image_urls: Sequence[str]) -> str | list[dict]:
     ]
 
 
+def model_field(model: str | Sequence[str]) -> dict:
+    """One id sends `model`; several send `models`, which OpenRouter tries in
+    order, moving on when one errors or is rate-limited."""
+    ids = [model] if isinstance(model, str) else [m for m in model if m]
+    # An empty list would send `models: []`, which is a request nothing can serve.
+    ids = ids or [FREE_ROUTER_MODEL]
+    return {"model": ids[0]} if len(ids) == 1 else {"models": ids}
+
+
 def build_request(
     context: str,
     question: str,
-    model: str,
+    model: str | Sequence[str],
     max_tokens: int,
     image_urls: Sequence[str] = (),
     max_price: float | None = None,
@@ -234,7 +243,7 @@ def build_request(
 ) -> dict:
     prompt = fit_to_budget(context, history, question, max_context_tokens)
     body = {
-        "model": model,
+        **model_field(model),
         "max_tokens": max_tokens,
         # Reasoning tokens come out of max_tokens, so a thinking model can spend
         # the whole budget and return empty content. Chat replies don't need it.
@@ -368,13 +377,41 @@ def _tool_calls(payload: dict) -> list[dict]:
     return calls if isinstance(calls, list) else []
 
 
+async def ask_once(
+    session: aiohttp.ClientSession,
+    system: str,
+    user: str,
+    *,
+    api_key: str,
+    model: str | Sequence[str],
+    max_tokens: int,
+    max_price: float | None = None,
+) -> ChatReply:
+    """One completion, no tools, no history, no images. For classification, where
+    the persona and the budget machinery would only be cost."""
+    body = {
+        **model_field(model),
+        "max_tokens": max_tokens,
+        "reasoning": {"enabled": False},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if max_price is not None:
+        body["provider"] = {"max_price": {"prompt": max_price, "completion": max_price}}
+
+    payload = await _post(session, body, build_headers(api_key))
+    return ChatReply(_extract_reply(payload), payload.get("model"), _reported_cost(payload))
+
+
 async def ask(
     session: aiohttp.ClientSession,
     context: str,
     question: str,
     *,
     api_key: str,
-    model: str = AUTO_ROUTER_MODEL,
+    model: str | Sequence[str] = AUTO_ROUTER_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     image_urls: Sequence[str] = (),
     max_price: float | None = None,

@@ -298,15 +298,42 @@ def reload_models(text="", image="", base="openrouter/auto"):
     m = importlib.reload(B)
     return m.OPENROUTER_TEXT_MODEL, m.OPENROUTER_IMAGE_MODEL
 
-check("blank text model falls back to auto", reload_models()[0] == "openrouter/auto")
-check("blank image model falls back to auto", reload_models()[1] == "openrouter/auto")
+FREE = B.FREE_ROUTER_MODEL
+check("blank text model falls back to auto", reload_models()[0] == ("openrouter/auto", FREE))
+check("blank image model falls back to auto", reload_models()[1] == ("openrouter/auto",))
 check("both fall back to OPENROUTER_MODEL",
-      reload_models(base="some/model") == ("some/model", "some/model"))
+      reload_models(base="some/model") == (("some/model", FREE), ("some/model",)))
 check("explicit models win",
       reload_models(text="text/one", image="image/one", base="some/model")
-      == ("text/one", "image/one"))
+      == (("text/one", FREE), ("image/one",)))
 check("one set, one blank",
-      reload_models(image="image/only", base="some/model") == ("some/model", "image/only"))
+      reload_models(image="image/only", base="some/model")
+      == (("some/model", FREE), ("image/only",)))
+
+# --- fallback chains ---
+check("a comma-separated list is a chain in order",
+      reload_models(text="a/one, b/two ,c/three")[0] == ("a/one", "b/two", "c/three", FREE))
+check("the free router is always last",
+      reload_models(text="a/one")[0][-1] == FREE)
+check("the free router isn't repeated when listed",
+      reload_models(text=f"a/one,{FREE}")[0] == ("a/one", FREE))
+check("the free router moves to the end when listed first",
+      reload_models(text=f"{FREE},a/one")[0] == ("a/one", FREE))
+check("duplicates are dropped, order kept",
+      reload_models(text="a/one,b/two,a/one")[0] == ("a/one", "b/two", FREE))
+check("blank entries are ignored",
+      reload_models(text="a/one,,  ,b/two")[0] == ("a/one", "b/two", FREE))
+# OpenRouter's "latest" alias prefix; stripping it makes the id invalid.
+check("a leading ~ survives parsing",
+      reload_models(text="~ex/model-latest")[0] == ("~ex/model-latest", FREE))
+# The free router has no vision endpoint, so appending it to the image chain would
+# only turn a busy paid model into "your backend is misconfigured".
+check("the image chain gets no free fallback",
+      reload_models(image="a/vision,b/vision")[1] == ("a/vision", "b/vision"))
+check("the text chain still does",
+      reload_models(text="a/one")[0] == ("a/one", FREE))
+check("an image chain of nothing but free keeps free",
+      reload_models(image=FREE)[1] == (FREE,))
 reload_models()
 
 # --- /forget clears the channel's memory ---
@@ -584,14 +611,26 @@ class Capture(logging.Handler):
     def emit(self, record): logged.append(record.getMessage())
 B.log.addHandler(Capture())
 B.log.setLevel(logging.INFO)
-B.search_web = page_returning({"organic_results": [{"title": "T", "link": "https://ex.com/1"}]})
+def search_returning(payload):
+    """search_web takes four positional arguments; page_returning's shape doesn't fit."""
+    async def fake(session, query, key, results=5):
+        return payload
+    return fake
+
+B.search_web = search_returning({"organic_results": [{"title": "T", "link": "https://ex.com/1"}]})
 B.web_budget = B.DailyBudget(10)
 
 tools = B.AgentTools(None, "asker in #general")
 logged.clear()
 asyncio.run(tools(call("search_web", '{"query": "how tall is nelson\'s column"}')))
-check("the call is logged with the arguments the model wrote",
-      any('search_web({"query": "how tall is nelson\'s column"})' in m for m in logged))
+# The arguments are written out of what someone said, so only their size is logged.
+check("the call is logged by name", any("search_web" in m and "Tool call" in m for m in logged))
+check("the arguments themselves are not logged",
+      not any("nelson" in m.lower() for m in logged))
+check("the argument length is logged", any("chars of arguments" in m for m in logged))
+# the successful search logs a result count, not what was searched for
+check("a successful search doesn't log the query",
+      not any("nelson" in m.lower() for m in logged) and any("result(s)" in m for m in logged))
 check("who asked is logged", any("asker in #general" in m for m in logged))
 check("the outcome is logged", any("returned" in m and "search_web" in m for m in logged))
 
@@ -609,10 +648,10 @@ asyncio.run(B.AgentTools(None, "asker")(call("rm -rf", "{}")))
 check("an invented tool name is logged",
       any("refused" in m and "no tool by that name" in m for m in logged))
 
-# control characters in a model-written argument can't forge a log line
+# a model-written argument reaches no log line at all
 logged.clear()
 asyncio.run(B.AgentTools(None, "asker")(call("read_page", '{"url": "http://x\nINFO forged"}')))
-check("newlines in arguments are scrubbed", not any(m.endswith("INFO forged") for m in logged))
+check("an argument can't forge a log line", not any("forged" in m for m in logged))
 
 print(f"bot wiring: {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

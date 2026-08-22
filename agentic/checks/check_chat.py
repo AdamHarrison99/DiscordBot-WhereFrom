@@ -22,6 +22,16 @@ def check(label, cond):
 body = ca.build_request("ctx", "q", ca.AUTO_ROUTER_MODEL, 300)
 check("no provider block by default", "provider" not in body)
 check("model passed through", body["model"] == "openrouter/auto")
+# One id sends `model`; several send `models`, which OpenRouter walks in order.
+check("a single model sends no models array", "models" not in body)
+chain = ca.build_request("ctx", "q", ["a/one", "b/two"], 300)
+check("a chain sends models, in order", chain["models"] == ["a/one", "b/two"])
+check("a chain sends no single model key", "model" not in chain)
+check("a one-entry chain is a plain model",
+      ca.build_request("ctx", "q", ["a/one"], 300)["model"] == "a/one")
+check("model_field drops blanks", ca.model_field(["a/one", "", "b/two"])["models"] == ["a/one", "b/two"])
+check("an empty chain falls back rather than sending models: []",
+      ca.model_field([]) == {"model": ca.FREE_ROUTER_MODEL})
 check("system prompt first", body["messages"][0]["role"] == "system")
 long_q = "x" * 5000
 check("question capped", len(ca.build_request("c", long_q, ca.AUTO_ROUTER_MODEL, 300)["messages"][1]["content"]) == ca.MAX_QUESTION_CHARS)

@@ -3,7 +3,9 @@ using Google Lens results via SerpApi."""
 
 from __future__ import annotations
 
+import asyncio
 import atexit
+import contextlib
 import json
 import logging
 import logging.handlers
@@ -60,6 +62,7 @@ from web_search import (
 )
 from chat_agent import (
     AUTO_ROUTER_MODEL,
+    FREE_ROUTER_MODEL,
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MEMORY_MINUTES,
@@ -76,6 +79,28 @@ from chat_agent import (
     ask,
     estimate_tokens,
     load_agent_context,
+)
+from ambient import (
+    DEFAULT_BUFFER_MESSAGES,
+    DEFAULT_COOLDOWN_SECONDS,
+    DEFAULT_DEBOUNCE_SECONDS,
+    DEFAULT_GATE_MODEL,
+    DEFAULT_MAX_PER_HOUR,
+    DEFAULT_MAX_WAIT_SECONDS,
+    DEFAULT_SELF_SUMMARY,
+    DEFAULT_STALE_MESSAGES,
+    DEFAULT_THRESHOLD,
+    AMBIENT_CONTEXT_NOTE,
+    REPLY_INSTRUCTION,
+    AmbientLimits,
+    ChannelBuffer,
+    MessageRecord,
+    build_reply_history,
+    count_newer,
+    images_for_reply,
+    is_readable,
+    judge,
+    resolve_mode,
 )
 
 NO_MATCH_MESSAGE = "No reliable source found for this image."
@@ -127,6 +152,29 @@ def env_flag(name: str, default: bool) -> bool:
     if not raw:
         return default
     return raw not in ("0", "false", "no", "off")
+
+
+def env_ids(name: str) -> tuple[int, ...]:
+    """Comma-separated Discord ids. A malformed entry is dropped and named, not
+    fatal - one typo shouldn't stop the bot starting."""
+    ids = []
+    for part in env_str(name).split(","):
+        part = part.strip()
+        if part.isascii() and part.isdigit():
+            ids.append(int(part))
+        elif part:
+            log.warning("Ignoring %s entry %r - ids are numeric", name, scrub(part, 40))
+    return tuple(ids)
+
+
+def env_models(name: str, default: str = "", free_last: bool = True) -> tuple[str, ...]:
+    """Comma-separated model ids, tried in the order given. The free router goes
+    last so a run of paid failures still gets one no-cost attempt - except where
+    it can't serve the request at all, and would only mistranslate a busy
+    upstream into "your backend is misconfigured"."""
+    ids = [m.strip() for m in env_str(name, default).split(",") if m.strip()]
+    ids = tuple(m for m in dict.fromkeys(ids) if m != FREE_ROUTER_MODEL)
+    return ids + (FREE_ROUTER_MODEL,) if free_last or not ids else ids
 
 
 def env_float(name: str, default: float, minimum: float = 0.0, maximum: float = 100.0) -> float:
@@ -293,10 +341,13 @@ SAUCENAO_MIN_SIMILARITY = env_float("SAUCENAO_MIN_SIMILARITY", DEFAULT_MIN_SIMIL
 
 # Optional. Without it the bot ignores @-mentions exactly as it did before.
 OPENROUTER_API_KEY = env_str("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = env_str("OPENROUTER_MODEL", AUTO_ROUTER_MODEL)
+_MODEL_SETTING = env_str("OPENROUTER_MODEL", AUTO_ROUTER_MODEL)
+OPENROUTER_MODEL = env_models("OPENROUTER_MODEL", AUTO_ROUTER_MODEL)
 # Per-kind overrides. Unset falls back to OPENROUTER_MODEL, i.e. auto routing.
-OPENROUTER_TEXT_MODEL = env_str("OPENROUTER_TEXT_MODEL", OPENROUTER_MODEL)
-OPENROUTER_IMAGE_MODEL = env_str("OPENROUTER_IMAGE_MODEL", OPENROUTER_MODEL)
+OPENROUTER_TEXT_MODEL = env_models("OPENROUTER_TEXT_MODEL", _MODEL_SETTING)
+# No free fallback here: openrouter/free has no vision endpoint, so it can only
+# turn a busy paid model into a misleading "backend isn't configured" error.
+OPENROUTER_IMAGE_MODEL = env_models("OPENROUTER_IMAGE_MODEL", _MODEL_SETTING, free_last=False)
 OPENROUTER_MAX_TOKENS = env_int("OPENROUTER_MAX_TOKENS", DEFAULT_MAX_TOKENS)
 # Dollars per million tokens. Unset means no ceiling; too low leaves no endpoints.
 # Blank and 0 are different: 0 is a real ceiling meaning free-only.
@@ -326,10 +377,22 @@ PAGE_READ_PER_MESSAGE = env_int("PAGE_READ_PER_MESSAGE", 2, minimum=0)
 # reply. Each round is another paid OpenRouter call.
 AGENT_TOOL_ROUNDS = env_int("AGENT_TOOL_ROUNDS", 2)
 
-MAX_SHOWN_MATCHES = 4
+# Ambient replies. Off by default, and deaf outside the channels listed here.
+AMBIENT_ENABLED = env_flag("AMBIENT_ENABLED", False)
+AMBIENT_CHANNELS = env_ids("AMBIENT_CHANNELS")
+# observe scores and logs, but posts nothing. Calibrate here first.
+AMBIENT_MODE = resolve_mode(env_str("AMBIENT_MODE", "observe"))
+AMBIENT_GATE_MODEL = env_models("AMBIENT_GATE_MODEL", DEFAULT_GATE_MODEL)
+AMBIENT_THRESHOLD = env_int("AMBIENT_THRESHOLD", DEFAULT_THRESHOLD, minimum=0)
+AMBIENT_DEBOUNCE_SECONDS = env_int("AMBIENT_DEBOUNCE_SECONDS", DEFAULT_DEBOUNCE_SECONDS, minimum=0)
+AMBIENT_MAX_WAIT_SECONDS = env_int("AMBIENT_MAX_WAIT_SECONDS", DEFAULT_MAX_WAIT_SECONDS)
+AMBIENT_COOLDOWN_SECONDS = env_int("AMBIENT_COOLDOWN_SECONDS", DEFAULT_COOLDOWN_SECONDS, minimum=0)
+AMBIENT_MAX_PER_HOUR = env_int("AMBIENT_MAX_PER_HOUR", DEFAULT_MAX_PER_HOUR, minimum=0)
+AMBIENT_BUFFER_MESSAGES = env_int("AMBIENT_BUFFER_MESSAGES", DEFAULT_BUFFER_MESSAGES)
+AMBIENT_STALE_MESSAGES = env_int("AMBIENT_STALE_MESSAGES", DEFAULT_STALE_MESSAGES, minimum=0)
+AMBIENT_SELF_SUMMARY = env_str("AMBIENT_SELF_SUMMARY", DEFAULT_SELF_SUMMARY)
 
-# Model-written, so it gets the same treatment as any other untrusted string.
-TOOL_ARG_LOG_CHARS = 300
+MAX_SHOWN_MATCHES = 4
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 SAUCE_TRIGGERS = ("?sauce", "!sauce")
@@ -368,10 +431,12 @@ def resolve_agent_context() -> str | None:
             MAX_CONTEXT_TOKENS,
         )
 
+    # OPENROUTER_MODEL is only a default; both overrides may leave it unused.
     log.info(
-        "@-mention replies enabled via %s, context from %s (~%d tokens, plus a %d budget "
-        "for history and the question)",
-        OPENROUTER_MODEL,
+        "@-mention replies enabled: text via %s, images via %s, context from %s (~%d "
+        "tokens, plus a %d budget for history and the question)",
+        " then ".join(OPENROUTER_TEXT_MODEL),
+        " then ".join(OPENROUTER_IMAGE_MODEL),
         path,
         tokens,
         MAX_CONTEXT_TOKENS,
@@ -390,7 +455,29 @@ def resolve_agent_context() -> str | None:
             PAGE_READ_PER_MESSAGE,
             PAGE_READ_MAX_CHARS,
         )
+    log_ambient_status()
     return context
+
+
+def log_ambient_status() -> None:
+    """Said out loud at startup because it widens what leaves the machine."""
+    if not AMBIENT_ENABLED:
+        log.info("Ambient replies disabled; the bot only speaks when spoken to")
+        return
+    if not AMBIENT_CHANNELS:
+        log.warning("AMBIENT_ENABLED is set but AMBIENT_CHANNELS is empty, so nothing is read")
+        return
+    log.info(
+        "Ambient replies %s in %d channel(s): gate %s at threshold %d, at most %d an "
+        "hour and no sooner than %ds apart. Unaddressed messages in those channels are "
+        "sent to the model.",
+        "ON" if AMBIENT_MODE == "reply" else "in observe mode (nothing is posted)",
+        len(AMBIENT_CHANNELS),
+        " then ".join(AMBIENT_GATE_MODEL),
+        AMBIENT_THRESHOLD,
+        AMBIENT_MAX_PER_HOUR,
+        AMBIENT_COOLDOWN_SECONDS,
+    )
 
 
 class DailyBudget:
@@ -419,6 +506,16 @@ conversations = Conversation(
     CONVERSATION_MEMORY_TURNS, CONVERSATION_MEMORY_MINUTES * 60
 )
 web_budget = DailyBudget(WEB_SEARCH_DAILY_LIMIT)
+ambient_buffer = ChannelBuffer(AMBIENT_BUFFER_MESSAGES, CONVERSATION_MEMORY_MINUTES * 60)
+ambient_limits = AmbientLimits(
+    AMBIENT_CHANNELS, AMBIENT_COOLDOWN_SECONDS, AMBIENT_MAX_PER_HOUR
+)
+# One pending evaluation per channel: two overlapping bursts would double-post.
+ambient_tasks: dict[int, asyncio.Task] = {}
+ambient_burst_started: dict[int, float] = {}
+ambient_running: set[int] = set()
+# Last @-mention per channel; an older evaluation drops its answer.
+ambient_interrupted: dict[int, float] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -666,6 +763,8 @@ async def forget(interaction: discord.Interaction) -> None:
         return
 
     cleared = conversations.forget(interaction.channel.id)
+    # One command, both memories - the ambient buffer is the same conversation.
+    cleared = ambient_buffer.forget(interaction.channel.id) or cleared
     await interaction.response.send_message(
         "Forgotten \N{EM DASH} starting fresh." if cleared else "Nothing to forget yet."
     )
@@ -907,7 +1006,7 @@ async def lookup_web(query: str, who: str) -> str:
     try:
         payload = await search_web(bot.session, query, SERPAPI_KEY, WEB_SEARCH_RESULTS)
     except WebNoResults:
-        log.info("Web search for %r found nothing", scrub(query, 100))
+        log.info("A web search of %d chars found nothing", len(query))
         return "The search returned nothing. Tell the user you couldn't find anything."
     except WebBadQuery:
         return "That search had no query in it."
@@ -930,8 +1029,8 @@ async def lookup_web(query: str, who: str) -> str:
         return "No results. Tell the user you couldn't find anything."
 
     log.info(
-        "Web search for %r: %d result(s)%s",
-        scrub(query, 100),
+        "A web search of %d chars: %d result(s)%s",
+        len(query),
         len(results),
         ", plus an answer box" if answer else "",
     )
@@ -1057,8 +1156,8 @@ class AgentTools:
         function = call.get("function") or {}
         name = function.get("name") or "?"
         arguments = function.get("arguments") or ""
-        # Verbatim, so the log shows what the model actually asked for.
-        log.info("Tool call from %s: %s(%s)", self.who, name, scrub(arguments, TOOL_ARG_LOG_CHARS))
+        # Length only: the model writes these out of what someone said.
+        log.info("Tool call from %s: %s (%d chars of arguments)", self.who, name, len(arguments))
 
         started = time.perf_counter()
         if name == "find_image_source":
@@ -1150,6 +1249,42 @@ class AgentTools:
         return await lookup_web(query, self.who)
 
 
+def describe_chat_failure(exc: BaseException) -> str:
+    """Logs a failed chat call and returns what a person should be told about it.
+    Shared so both reply paths classify the same errors identically - only the
+    mention path posts the result, because a channel that never asked deserves
+    silence rather than an apology."""
+    if isinstance(exc, ChatRateLimited):
+        log.warning("OpenRouter free-tier limit reached: %s", exc)
+        return "I've used up my free questions for now. Try again later."
+    if isinstance(exc, ChatAuthError):
+        log.error("OpenRouter rejected the API key")
+        return "My chat API key isn't working. Please tell the server admin."
+    if isinstance(exc, ChatNoEndpoints):
+        log.error(
+            "Nothing matched the routing constraints (%s). OPENROUTER_MAX_PRICE=%s may "
+            "be too low - vision models cost well over $1/M - or the account's data "
+            "policy at https://openrouter.ai/settings/privacy is too restrictive",
+            exc,
+            OPENROUTER_MAX_PRICE,
+        )
+        return "My chat backend isn't configured right. Please tell the server admin."
+    if isinstance(exc, ChatUnavailable):
+        log.info("No free model available: %s", exc)
+        return "No free model has capacity right now. Try again in a minute."
+    if isinstance(exc, ChatRefused):
+        log.info("Model declined to answer: %s", exc)
+        return "I'd rather not answer that one."
+    if isinstance(exc, ChatEmptyReply):
+        log.warning("The model returned an empty reply (%s)", exc.detail)
+        return "The model returned an empty reply \N{EM DASH} ask me again?"
+    if isinstance(exc, ChatError):
+        log.warning("Chat reply failed: %s", exc)
+        return f"Couldn't answer that \N{EM DASH} {exc}."
+    log.error("Unexpected error from the chat model", exc_info=exc)
+    return "Something went wrong answering that."
+
+
 async def answer_mention(
     question: str,
     image_urls: list[str],
@@ -1179,36 +1314,8 @@ async def answer_mention(
             tool_runner=tools,
             max_tool_rounds=AGENT_TOOL_ROUNDS,
         )
-    except ChatRateLimited as exc:
-        log.warning("OpenRouter free-tier limit reached: %s", exc)
-        return "I've used up my free questions for now. Try again later.", False
-    except ChatAuthError:
-        log.error("OpenRouter rejected the API key")
-        return "My chat API key isn't working. Please tell the server admin.", False
-    except ChatNoEndpoints as exc:
-        log.error(
-            "Nothing matched the routing constraints (%s). OPENROUTER_MAX_PRICE=%s may "
-            "be too low - vision models cost well over $1/M - or the account's data "
-            "policy at https://openrouter.ai/settings/privacy is too restrictive",
-            exc,
-            OPENROUTER_MAX_PRICE,
-        )
-        return "My chat backend isn't configured right. Please tell the server admin.", False
-    except ChatUnavailable as exc:
-        log.info("No free model available: %s", exc)
-        return "No free model has capacity right now. Try again in a minute.", False
-    except ChatRefused as exc:
-        log.info("Model declined to answer: %s", exc)
-        return "I'd rather not answer that one.", False
-    except ChatEmptyReply as exc:
-        log.warning("The model returned an empty reply (%s)", exc.detail)
-        return "The model returned an empty reply \N{EM DASH} ask me again?", False
-    except ChatError as exc:
-        log.warning("Chat reply failed: %s", exc)
-        return f"Couldn't answer that \N{EM DASH} {exc}.", False
-    except Exception:
-        log.exception("Unexpected error answering a mention")
-        return "Something went wrong answering that.", False
+    except Exception as exc:
+        return describe_chat_failure(exc), False
 
     log.info(
         "Answered via %s, cost $%.6f (%d chars)%s",
@@ -1239,6 +1346,8 @@ async def handle_mention(message: discord.Message) -> bool:
     if not (mentions_bot(message) or replying_to_bot):
         return False
 
+    cancel_ambient(message.channel.id)
+
     who = describe_invocation(message.author, message.channel, message.guild)
     if not mention_throttle.allow(message.author.id):
         log.info("Throttled mention from %s", who)
@@ -1264,12 +1373,13 @@ async def handle_mention(message: discord.Message) -> bool:
     remembered = f"{speaker}: {question}"
     history = conversations.history(message.channel.id)
 
+    # Length, never the text: what people say to the bot stays out of the log.
     log.info(
-        "Mention from %s (%d image(s), %d remembered): %s",
+        "Mention from %s (%d chars, %d image(s), %d remembered)",
         who,
+        len(question),
         len(image_urls),
         len(history),
-        scrub(question),
     )
     async with message.channel.typing():
         answer, keep = await answer_mention(remembered, image_urls, history, who)
@@ -1281,10 +1391,235 @@ async def handle_mention(message: discord.Message) -> bool:
     return True
 
 
+def to_record(message: discord.Message) -> MessageRecord:
+    """The discord boundary: nothing below this line knows what a Message is."""
+    images = image_urls_in(message)
+    return MessageRecord(
+        author=message.author.display_name,
+        author_id=message.author.id,
+        is_bot=message.author.bot,
+        text=message.clean_content,
+        image_urls=tuple(images),
+        message_id=message.id,
+        at=time.monotonic(),
+        # Video, audio and documents are noted so the model knows they exist and
+        # can say it can't open them, never fetched or described.
+        other_files=len(message.attachments) > len(images),
+    )
+
+
+def observe_ambient(message: discord.Message) -> MessageRecord | None:
+    """Buffer every message in an opted-in channel, the bot's own included -
+    without those it can't see that it already spoke. Buffering is not gating: a
+    message a mention handles still belongs in the transcript."""
+    if not AMBIENT_ENABLED or AGENT_CONTEXT is None or message.guild is None:
+        return None
+    # Nothing is held for a channel it will never speak in.
+    if message.channel.id not in AMBIENT_CHANNELS:
+        return None
+    record = to_record(message)
+    ambient_buffer.add(message.channel.id, record)
+    return record
+
+
+def ambient_eligible(message: discord.Message, record: MessageRecord) -> bool:
+    channel = message.channel
+    if channel.id not in AMBIENT_CHANNELS:
+        return False
+    # A DM is a conversation of two; an uninvited third voice is worse there.
+    if message.guild is None:
+        return False
+    # Other bots are transcript, never a trigger: two of these would loop.
+    if message.author.bot:
+        return False
+    return is_readable(record)
+
+
+def consider_ambient(message: discord.Message, record: MessageRecord | None) -> None:
+    """Trailing debounce with a deadline: each message pushes the evaluation back
+    until the burst ends, but a channel that never goes quiet still gets judged."""
+    if record is None or not ambient_eligible(message, record):
+        return
+
+    channel_id = message.channel.id
+    # One running evaluation per channel; how far the conversation has since
+    # moved is AMBIENT_STALE_MESSAGES' decision, not this one's.
+    if channel_id in ambient_running:
+        return
+
+    pending = ambient_tasks.get(channel_id)
+    if pending is not None and not pending.done():
+        pending.cancel()
+    started = ambient_burst_started.setdefault(channel_id, time.monotonic())
+    ambient_tasks[channel_id] = asyncio.create_task(
+        ambient_after_debounce(message.channel, started)
+    )
+
+
+def cancel_ambient(channel_id: int) -> None:
+    """A mention owns the channel now; posting both is a visible double-reply.
+    A running evaluation isn't cancelled mid-request - it reads the timestamp and
+    drops its answer, which leaves the HTTP call to finish tidily."""
+    ambient_interrupted[channel_id] = time.monotonic()
+    pending = ambient_tasks.pop(channel_id, None)
+    ambient_burst_started.pop(channel_id, None)
+    if pending is not None and not pending.done():
+        pending.cancel()
+
+
+async def ambient_after_debounce(channel: discord.abc.Messageable, started: float) -> None:
+    channel_id = channel.id
+    try:
+        deadline = started + AMBIENT_MAX_WAIT_SECONDS - time.monotonic()
+        await asyncio.sleep(max(0.0, min(AMBIENT_DEBOUNCE_SECONDS, deadline)))
+        ambient_burst_started.pop(channel_id, None)
+        if ambient_tasks.get(channel_id) is asyncio.current_task():
+            del ambient_tasks[channel_id]
+        ambient_running.add(channel_id)
+        await run_ambient(channel)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Ambient evaluation failed in channel %s", channel_id)
+    finally:
+        ambient_running.discard(channel_id)
+        if ambient_tasks.get(channel_id) is asyncio.current_task():
+            del ambient_tasks[channel_id]
+
+
+async def run_ambient(channel: discord.abc.Messageable) -> None:
+    """Local gate, then judge, then threshold, then a staleness re-check. Every
+    layer above the first is only reached because the cheaper ones let it past."""
+    channel_id = channel.id
+    records = ambient_buffer.recent(channel_id, AMBIENT_BUFFER_MESSAGES)
+
+    refusal = ambient_limits.allow(channel_id, records)
+    if refusal:
+        log.debug("Ambient: quiet in %s - %s", channel_id, refusal)
+        return
+
+    started = time.monotonic()
+    seen_id = ambient_buffer.newest_id(channel_id)
+
+    try:
+        judgement = await judge(
+            bot.session,
+            records,
+            api_key=OPENROUTER_API_KEY,
+            model=AMBIENT_GATE_MODEL,
+            self_summary=AMBIENT_SELF_SUMMARY,
+            max_price=OPENROUTER_MAX_PRICE,
+        )
+    except Exception as exc:
+        log.info("Ambient gate failed, staying quiet: %s", describe_chat_failure(exc))
+        return
+
+    verdict = judgement.verdict
+    log.info(
+        "Ambient gate in %s: %d/%d, target %s, $%.6f via %s - %s",
+        channel_id,
+        verdict.score,
+        AMBIENT_THRESHOLD,
+        verdict.target or "none",
+        judgement.cost,
+        judgement.model or "?",
+        scrub(verdict.reason),
+    )
+    if verdict.score < AMBIENT_THRESHOLD:
+        return
+
+    text, cost, model = await compose_ambient(channel, records, verdict.target)
+    if not text:
+        log.info("Ambient: nothing to say in %s after all", channel_id)
+        return
+
+    if ambient_interrupted.get(channel_id, 0.0) > started:
+        log.info("Ambient: dropped in %s, mentioned while thinking", channel_id)
+        return
+    moved = count_newer(ambient_buffer.recent(channel_id), seen_id)
+    if moved > AMBIENT_STALE_MESSAGES:
+        log.info("Ambient: dropped in %s, %d messages arrived while thinking", channel_id, moved)
+        return
+
+    # Counted in observe mode too, so the logged cadence matches a live one.
+    ambient_limits.record_reply(channel_id)
+    # The bot's own words are logged; the conversation that prompted them is not.
+    verb = "would have said" if AMBIENT_MODE != "reply" else "says"
+    log.info("Ambient %s in %s ($%.6f via %s): %s",
+             verb, channel_id, cost, model or "?", scrub(text, 400))
+    if AMBIENT_MODE != "reply":
+        return
+    await post_ambient(channel, records, verdict.target, text)
+
+
+async def compose_ambient(
+    channel: discord.abc.Messageable,
+    records: list[MessageRecord],
+    target: int | None,
+) -> tuple[str, float, str | None]:
+    """The reply itself. No tools: with none offered there is nothing for the
+    model to spend a round on, and the top-link reinstatement has nothing to fix."""
+    images = images_for_reply(records, target)
+    history = build_reply_history(records, bot.user.id if bot.user else 0)
+    # Typing means "I've decided to speak", so it never shows while judging, and
+    # never in observe mode, where nothing is going to appear.
+    typing = channel.typing() if AMBIENT_MODE == "reply" else contextlib.nullcontext()
+
+    try:
+        async with typing:
+            reply = await ask(
+                bot.session,
+                f"{AGENT_CONTEXT}\n\n{AMBIENT_CONTEXT_NOTE}",
+                REPLY_INSTRUCTION,
+                api_key=OPENROUTER_API_KEY,
+                model=OPENROUTER_IMAGE_MODEL if images else OPENROUTER_TEXT_MODEL,
+                max_tokens=OPENROUTER_MAX_TOKENS,
+                image_urls=images,
+                max_price=OPENROUTER_MAX_PRICE,
+                max_context_tokens=MAX_CONTEXT_TOKENS,
+                history=history,
+            )
+    except Exception as exc:
+        log.info("Ambient reply failed, staying quiet: %s", describe_chat_failure(exc))
+        return "", 0.0, None
+
+    return reply.text.strip()[:DISCORD_MESSAGE_LIMIT], reply.cost, reply.model
+
+
+async def post_ambient(
+    channel: discord.abc.Messageable,
+    records: list[MessageRecord],
+    target: int | None,
+    text: str,
+) -> None:
+    """Silent every time - an unprompted message should never buzz a phone - and
+    referenced only when the judge points further up than the newest message."""
+    referenced = None
+    if target is not None and 1 <= target <= len(records):
+        chosen = records[target - 1]
+        if chosen.message_id != ambient_buffer.newest_id(channel.id):
+            referenced = channel.get_partial_message(chosen.message_id)
+
+    if referenced is not None:
+        try:
+            # mention_author=False is load-bearing: the client sets replied_user=True.
+            await referenced.reply(text, mention_author=False, silent=True)
+            return
+        except discord.HTTPException as exc:
+            log.info("Ambient: target message is gone (%s), sending plainly", exc)
+
+    try:
+        await channel.send(text, silent=True)
+    except discord.HTTPException as exc:
+        log.warning("Couldn't post an ambient reply in %s: %s", channel.id, exc)
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
+    record = observe_ambient(message)
     if await handle_sauce_reply(message) or await handle_mention(message):
         return
+    consider_ambient(message, record)
     # Overriding on_message replaces the default, which is what normally
     # dispatches prefix commands - so do it here. Skipped above because
     # `when_mentioned` makes every handled mention an unknown command, which

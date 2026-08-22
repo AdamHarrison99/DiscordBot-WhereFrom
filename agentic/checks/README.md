@@ -10,6 +10,7 @@ Run them from the repo root so the venv is on hand:
 .venv/Scripts/python.exe agentic/checks/check_bot.py    # bot.py wiring
 .venv/Scripts/python.exe agentic/checks/check_web.py    # web_search.py
 .venv/Scripts/python.exe agentic/checks/check_page.py   # page_reader.py
+.venv/Scripts/python.exe agentic/checks/check_ambient.py  # ambient.py + its bot.py wiring
 ```
 
 All default to the repo root and need no arguments; pass a path to point one elsewhere.
@@ -19,6 +20,11 @@ parts that only misbehave against real Discord: mention detection, the reply tri
 image collection, throttling, and conversation memory. It also covers the agent's tool
 dispatch — which tools are offered, the per-message and daily rationing, and every
 failure path turning into something the model can say instead of an exception.
+
+`check_ambient.py` drives the whole ambient path without a network: the buffer and its
+TTL, every named refusal from the local gate, the debounce and its deadline, verdict
+parsing failing closed, which message a reply attaches to, and the two races that abort a
+post. Fixtures use placeholder speakers, as everything here does.
 
 `check_page.py` fakes DNS as well as HTTP, so the address guard is exercised for real:
 private, loopback and link-local targets, and redirects into them.

@@ -33,13 +33,19 @@ than duplicating it here. This file is what the README can't tell you.
 | `sauce_search.py` | SauceNAO HTTP layer. Same deal |
 | `web_search.py` | SerpApi plain-Google HTTP layer, for the agent's `search_web` tool |
 | `page_reader.py` | Fetches a URL and extracts text. Stdlib HTML parsing, no new deps |
-| `chat_agent.py` | OpenRouter free-router chat for @-mentions, plus the per-user throttle |
+| `chat_agent.py` | OpenRouter chat for @-mentions, the per-user throttle, and `ask_once` |
+| `ambient.py` | Deciding whether to speak unprompted: buffer, local gate, judge. No discord imports |
 | `startup.bat` / `startup.sh` | Run the bot, creating the venv on first run |
 
 Both *image* search modules return the same normalised match dict — `title`, `link`,
 `source`, `thumbnail`, `similarity` — which is the only contract `build_embed` depends on.
 Keep any new engine to that shape. `web_search.py` is deliberately outside it: its results
 are text for the model, never an embed.
+
+`ambient.py` holds the decision, `bot.py` holds the discord: `to_record` is the only
+boundary between them, and the reply goes through `ask()` with no tools rather than through
+`answer_mention`. `describe_chat_failure` is shared by both reply paths — the mention posts
+what it returns, ambient only logs it.
 
 `AgentTools` in `bot.py` is the single tool_runner handed to `ask()`. It owns which tools
 are offered (`definitions`) and the per-message rationing; `SourceFinder` is one tool
@@ -78,12 +84,16 @@ behind it, not the runner itself.
 - **`FakeSession` in `check_chat.py` deep-copies each request body.** `ask()` mutates one
   dict across rounds, so recording the reference makes every request look like the last —
   which silently passed a check asserting per-round state.
-- **Tool calls log as a three-line story at INFO**: the call with the model's own
-  arguments verbatim, what happened (searched / read / refused, with the reason), then the
-  reply length and elapsed time. Every guard goes through `AgentTools._refuse` so a
-  refused call can't look like one that never happened. `LOG_LEVEL=DEBUG` adds each search
-  result's title and link. Arguments are `scrub`bed — they're model-written, so a newline
-  in one would otherwise forge a log line.
+- **Tool calls log as a three-line story at INFO**: the call by name with its argument
+  *length*, what happened (searched / read / refused, with the reason), then the reply
+  length and elapsed time. Every guard goes through `AgentTools._refuse` so a refused call
+  can't look like one that never happened. `LOG_LEVEL=DEBUG` adds each search result's
+  title and link — upstream text, not anyone's. **No search query reaches the log**, in
+  `AgentTools` or in `lookup_web`, on the success path or the empty one: the model writes
+  a query out of what someone asked, so logging it puts that person's question on disk by
+  another route. Only its length is recorded. URLs are the deliberate exception — a link
+  names a public page rather than quoting anybody, and which hosts refuse us is most of
+  what `read_page` debugging is.
 - **Everything a tool returns is untrusted input.** Anyone can post a link to a page they
   wrote, so `describe_page` and `describe_web_results` label their contents as quoted
   material and say outright that instructions inside it don't count.
@@ -124,6 +134,35 @@ behind it, not the runner itself.
   Cloud key, and taking on another provider was declined.
 - **SauceNAO reports failures inside a 200 response** — negative `status`, `user_id: 0` for
   a bad key, negative `short_remaining`/`long_remaining` for quota. See `_check_header`.
+- **Nothing anyone says reaches disk.** The ambient buffer and the conversation memory are
+  in memory only, and no log line carries message text — mentions log a character count,
+  ambient logs the score, the guard that fired and the bot's own words. The judge prompt
+  tells the gate to describe rather than quote, because its reason *is* logged. Don't add
+  a DEBUG transcript dump: the log would become a file of other people's conversation.
+- **Ambient reads text and images, nothing else.** `to_record` collects image URLs and sets
+  `other_files` for everything else; the transcript marks those so the model can say it
+  can't open them, and a message with no text and no image never buys a gate call
+  (`is_readable`). Video, audio and documents are never fetched.
+- **The reply prompt says outright that nobody asked.** Without `AMBIENT_CONTEXT_NOTE` the
+  model reads the transcript as a question put to it and answers like a summoned assistant
+  — greeting the channel, summarising, offering more help. The persona alone doesn't fix it.
+- **The gate is text-only and the reply is not.** `openrouter/free` works for the judge at
+  zero cost precisely because no image is sent; the no-free-vision finding above still
+  binds the reply, which is why that side uses auto routing.
+- **`silent=True` and `mention_author=False` on every ambient post.** The client sets
+  `replied_user=True`, so a reference without the override pings someone who never asked.
+  A reply to the newest message is visual noise, so that case degrades to a plain `send`.
+- **Ambient failures are silent, deliberately.** A user who @-mentions the bot deserves "my
+  API key isn't working"; a channel that never asked deserves nothing. Both classify
+  through `describe_chat_failure`; only the mention path posts the string.
+- **A message arriving mid-evaluation doesn't cancel it.** `ambient_running` holds the
+  channels with a judge or a reply in flight; `consider_ambient` schedules nothing for
+  those. Cancelling instead would abort a running HTTP request on every new message and
+  leave `AMBIENT_STALE_MESSAGES` deciding nothing. A mention interrupts by timestamp
+  (`ambient_interrupted`), read just before posting, for the same reason.
+- **Observe mode costs the same as running live.** It pays for the judge *and* the reply,
+  and consumes the hourly slot, so the logged cadence matches what a live run would do.
+  That's the point — you're reading what it would have said.
 - **`bot.py` reads env at import time** (`os.environ[...]`). Importing it without
   `DISCORD_BOT_TOKEN` / `SERPAPI_KEY` set raises `KeyError`. Set dummies to import in tests.
 - **Logging goes through a `QueueListener`** so disk writes never block the event loop, and
@@ -144,6 +183,28 @@ behind it, not the runner itself.
   so far; tested 1 (vision fails), 5 and 10 (both fine). Conversely, `max_price: 0` is what
   made the *free* router work on an account with a zero credit limit — without it, even
   free requests 404'd.
+- **Every model setting is a fallback chain.** `env_models` parses a comma-separated
+  list and appends `FREE_ROUTER_MODEL` last, so the final attempt costs nothing;
+  `model_field` then sends `model` for one id and `models` for several. Verified live
+  2026-08-22: a `models` array whose first entry is rate-limited is served by the second.
+  Two limits — **an invalid model id is a hard 400, not a skipped entry**, and `route:
+  "fallback"` is neither needed nor helpful (it 429'd where the bare array succeeded).
+  **`OPENROUTER_IMAGE_MODEL` is the exception** (`free_last=False`): a router with no vision
+  endpoint can only turn a busy paid model into `ChatNoEndpoints`, which reads to the user
+  as "the admin misconfigured me". It is dropped from that chain even when inherited from
+  `OPENROUTER_MODEL` — unless it is all that chain has, since nothing can serve an empty one.
+- **A leading `~` is OpenRouter's "latest" alias and is part of the id.**
+  `~deepseek/deepseek-v4-flash-latest` resolves to a dated build; stripping the tilde
+  gives "is not a valid model ID". Don't "clean" it out of a config value.
+- **An account privacy policy shrinks the free pool to almost nothing.** With
+  non-zero-retention providers disallowed, `openrouter/free` had exactly one endpoint
+  permitted out of 18, and it was rate-limited on 5 of 5 attempts. `max_price: 0` then
+  fails outright with `ChatNoEndpoints` naming the data policy — so the older
+  "`max_price: 0` rescues the free router" finding only holds without such a policy.
+  `/api/v1/models/user` returns the account-filtered catalogue and is the way to check.
+- **The image model needs tool calling as well as vision.** `google/gemini-2.5-flash-image`
+  has vision and no `tools`, so it would take the mention path and silently lose
+  `find_image_source`. Check `supported_parameters` before pinning one.
 - **Reasoning tokens are billed out of `max_tokens`.** A thinking model will spend the
   whole budget and return empty `content` with `reasoning` populated. Every request sends
   `reasoning: {"enabled": false}`; that's what fixed the intermittent empty replies.
@@ -186,6 +247,11 @@ behind it, not the runner itself.
 - `.env.example` and `agent_context.example.md` are committed templates for gitignored
   files. Add new vars to the example with a comment explaining what each one buys you.
   `agent_context.md` is deliberately *not* a copy of its example — don't sync them.
+- **Auditing before a commit includes a PII strip.** Read the tracked tree — not only the
+  diff — for anything that identifies a person or a machine: names, emails, handles, server
+  or channel ids, absolute paths from a developer's disk, API keys, and quoted messages.
+  Commit messages count; so do comments, docstrings, fixtures and example files. Do it by
+  reading and reasoning, not with a word list — a blacklist passes the thing it hasn't seen.
 - **Memories go in `agentic/memory/`**, never in a per-session store outside the repo —
   one file per fact, linked from `memory/MEMORY.md`. They're published like everything
   else here, so write the rule, not who asked for it or when.
@@ -200,11 +266,17 @@ is unit-tested offline. The SauceNAO fallback landed after that and has **not** 
 verified live.
 
 **@-mention chat is built and works live** (`chat_agent.py`, `plans/MENTION_AGENT_PLAN.md`).
-394 offline checks (127 `chat_agent`, 163 `bot.py` wiring against faked messages, 36
-`web_search`, 68 `page_reader`), plus both paths verified end-to-end against the real API
-— text and an image correctly described, $0.0001–0.002 a reply. `agent_context.md` is read
+563 offline checks (132 `chat_agent`, 173 `bot.py` wiring against faked messages, 36
+`web_search`, 68 `page_reader`, 154 `ambient`), plus both paths verified end-to-end
+against the real API — text and an image correctly described, $0.0001–0.002 a reply. `agent_context.md` is read
 at startup only — there is deliberately no reload command, so a personality edit needs a
 restart.
+
+**Ambient replies are built and offline-verified only** (2026-08-22): `ambient.py` plus its
+`bot.py` wiring, 154 checks covering the buffer, every named refusal, the debounce and its
+deadline, verdict parsing, reply shaping and both mid-flight aborts. Never run against real
+Discord or a real gate model, so the judge's calibration is guesswork until observe mode
+has run for a few days — `AMBIENT_THRESHOLD=70` is a starting point, not a measured one.
 
 **`search_web` and `read_page` are offline-verified only** (2026-08-16): request contract,
 error mapping, redirect and address guards, rationing and the dispatcher are all covered

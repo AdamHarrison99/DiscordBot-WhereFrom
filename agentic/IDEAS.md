@@ -9,8 +9,7 @@ pointer. An idea that ships loses its entry altogether.
 
 ## Ambient replies — speak without being @-mentioned
 
-**Status: planned, not built.** See `plans/AMBIENT_REPLIES_PLAN.md`.
+**Status: BUILT** (2026-08-22). See `plans/AMBIENT_REPLIES_PLAN_(DONE).md` and the `AMBIENT_`
+block in `.env.example`. Off by default, per-channel opt-in.
 
-A config option letting the bot join a conversation on its own: when it's being talked
-about, when it can supply context nobody has, when a joke lands. It must not always
-respond, and must not respond emptily.
+Entry kept only until the live run settles the threshold; delete it then, per the note above.

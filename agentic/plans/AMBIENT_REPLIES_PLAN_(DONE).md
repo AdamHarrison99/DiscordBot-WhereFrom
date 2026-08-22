@@ -1,8 +1,9 @@
 # Plan: ambient replies — speak without being @-mentioned
 
-**Status: not built.** Design only. Supersedes the `../IDEAS.md` entry, which is now just a
-pointer here — the research, the rejected alternatives and the costings all live in this
-file.
+**Status: BUILT** (2026-08-22), offline-verified only — never run against real Discord or a
+real gate model. `ambient.py`, its `bot.py` wiring and `agentic/checks/check_ambient.py`.
+Where the build departed from this document, the last section says so; everything else
+landed as written.
 
 ## Goal
 
@@ -415,36 +416,39 @@ Calibration is empirical, not designed. That's what observe mode is for.
   provider the router picks. That is a real widening and the README has to say so plainly.
   This runs on one private server, but the repo is public and AGPL, so the shipped default
   has to be the conservative one.
-- **DMs and NSFW channels excluded**, and not reachable via `AMBIENT_CHANNELS` either — a
-  DM is a conversation of two where an uninvited third voice is worse than in a guild.
+- **DMs excluded**, and not reachable via `AMBIENT_CHANNELS` either — a DM is a
+  conversation of two where an uninvited third voice is worse than in a guild.
 - Transcripts are untrusted input, exactly like tool output. The judge prompt says so, and
   the judge's output is parsed as three regex-matched fields — nothing but a number, an
   integer and a short string survives parsing, so it can't smuggle instructions through.
 - The buffer is memory-only and TTL'd, like `Conversation`. A restart forgets.
 - `/forget` clears the ambient buffer for the channel too.
 
-### The observe-mode log is full of other people's conversation
+### Nothing anyone says reaches disk
 
-Worth stating on its own, because it's the one genuinely new disclosure risk this feature
-creates and it points *inward*, at this repo, rather than at the model provider.
+The plan originally had observe mode log the transcript at `DEBUG`, on the grounds that
+calibration needs to see what the judge saw. That was rejected during the build and the
+rule is now absolute: **no message text is written to the log, ever.**
 
-Observe mode exists to be read: it logs the score, the reason and the reply it would have
-posted, and at `DEBUG` the transcript that produced them. That log is therefore a file of
-verbatim messages written by people who never addressed the bot — the most sensitive
-artefact this project has ever produced, and it lands on disk by design.
+What survives is enough to calibrate on — the score, the threshold it was measured
+against, which local guard refused, the cost, and the bot's own reply. What it would have
+*said* is a bot response and is logged in full; what prompted it is not. The mention path
+was brought into line at the same time and now logs a character count where it used to log
+the question.
 
-`*.log` and `*.log.*` are gitignored, so the file itself can't be committed by accident.
-The exposure is what gets *copied out* of it:
+Two consequences worth keeping:
 
-- **Never paste log excerpts into the repo.** Not into `CLAUDE.md` as a hard-won fact, not
-  into a commit message, not into a plan. Everything here is published.
-- When the live run teaches something worth recording — a threshold, a failure mode, a
-  judge that over-fires on a particular shape of message — **write the finding, not the
-  transcript**. "The judge scored agreement-only replies too highly" carries the lesson;
-  quoting the exchange that proved it carries someone's chat into a public repo.
-- The same applies to `AMBIENT_CHANNELS`: real channel IDs go in `.env`, which is
-  gitignored. `.env.example` ships it empty, and must stay that way — an ID identifies a
-  specific server and channel.
+- **The judge's `REASON` is logged**, and the judge is looking at people's messages when it
+  writes it. The prompt therefore tells it to describe rather than quote. That is a prompt
+  instruction, not a guarantee, which is the one soft edge in this rule.
+- **Never paste log excerpts into the repo** — not into `CLAUDE.md` as a hard-won fact, not
+  into a commit message, not into a plan. When the live run teaches something, write the
+  finding, not the material: "the judge over-scored agreement-only replies" carries the
+  lesson without carrying anyone's chat into a public repo.
+
+`AMBIENT_CHANNELS` gets the same treatment: real channel ids go in `.env`, which is
+gitignored. `.env.example` ships it empty and must stay that way — an id identifies a
+specific server and channel.
 
 ## Testing
 
@@ -543,3 +547,39 @@ Recorded so they aren't mistaken for bugs later:
 - `agentic/IDEAS.md` — already trimmed to a pointer at this plan; delete the entry outright
   once this is built and the plan is marked implemented.
 - `agent_context.example.md` — whether the persona needs to know it may speak unprompted.
+
+## What changed during the build
+
+Recorded because the rest of this document describes the design, not the diff.
+
+- **No transcript in the log, at any level.** See above. The plan's observe-mode logging
+  was cut back to the score, the guard, the cost and the bot's own words.
+- **Text and images only.** `MessageRecord` gained `other_files`; video, audio and
+  documents are marked in the transcript so the model can say it can't open them, and a
+  message carrying nothing else never buys a gate call (`is_readable`). The judge prompt
+  and the persona both got a line saying so.
+- **The reply prompt states that nobody asked.** `AMBIENT_CONTEXT_NOTE` is prepended to
+  the persona for ambient replies only. Without it the model reads the transcript as a
+  question put to it and answers like a summoned assistant.
+- **`judge()` returns a `Judgement`, not a `Verdict`** — the verdict plus the cost and the
+  routed model, so `bot.py` can log the spend where the logger lives.
+- **Staleness is counted by message id** (`count_newer`), not by buffer length: the deque
+  stops growing once full, so length would silently stop detecting drift.
+- **Observe mode consumes the hourly slot.** Otherwise the cadence in the log is not the
+  cadence a live run would have had, which defeats the purpose of calibrating on it.
+- **The reply transcript goes in `history`, not in the question.** `MAX_QUESTION_CHARS` is
+  1000, which a twelve-message transcript would overrun.
+- **A message arriving after the debounce doesn't cancel the evaluation.** The plan had
+  every message cancel and reschedule; taken literally that cancels a *running* judge
+  mid-request, so one message would abort every reply and make `AMBIENT_STALE_MESSAGES`
+  dead code. `ambient_running` now separates the two: while an evaluation is in flight
+  nothing new is scheduled, and how far the conversation moved is the staleness count's
+  decision. A mention still interrupts, by timestamp rather than by cancellation, so the
+  in-flight HTTP call finishes tidily.
+- **Only opted-in channels are buffered.** The plan buffered every message so a
+  mention-handled one still reached the transcript, which is right *within* a channel the
+  bot may speak in - but it also held conversation from channels it never can. Nothing is
+  now kept for a channel not in `AMBIENT_CHANNELS`.
+- **The NSFW-channel exclusion was dropped.** The plan refused age-restricted channels
+  alongside DMs; on a private server that is the owner's call to make in Discord, not the
+  bot's to override. `AMBIENT_CHANNELS` is the opt-in either way.
