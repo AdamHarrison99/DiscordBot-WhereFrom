@@ -16,6 +16,13 @@ than duplicating it here. This file is what the README can't tell you.
 - Branch is **`master`**, not `main`.
 - Git identity is set **locally in this repo only** — don't assume `--global` works.
 - **Never `git push` without asking first.** Local commits are fine unprompted.
+- **Never quote a real message — not in a commit message, a comment, a doc or a log
+  excerpt. Paraphrase.** The subject matter here is other people's conversations, so an
+  example showing "what actually happened" is someone's chat, and a commit message is
+  published as loudly as the code. Say what the behaviour was, not what was said: "a
+  follow-up resolved against the previous turn", never the turn itself. Fixtures use
+  placeholder speakers (`alpha`, `bravo`) and `CHANNEL = 1` — prose gets the same
+  treatment. Everything in the tree is published — see `memory/wherefrom-project.md`.
 
 ## Code map
 
@@ -124,7 +131,7 @@ behind it, not the runner itself.
   double-formats every record through the QueueHandler.
 - **Mention replies cost money, deliberately.** `openrouter/auto` routes to paid models;
   ~$0.0001–0.0008 per reply, logged per call. This was a considered switch away from
-  free-only, not drift — see `MENTION_AGENT_PLAN.md`. Don't "restore" the free-only guards.
+  free-only, not drift — see `plans/MENTION_AGENT_PLAN.md`. Don't "restore" the free-only guards.
 - **`openrouter/free` has no reachable vision endpoint.** Text works at zero cost, but any
   image request 404s with "No endpoints available matching your guardrail restrictions and
   data policy" — that's `ChatNoEndpoints`. Tested against explicit free vision models
@@ -192,7 +199,7 @@ embed against the real SerpApi. Error classification (quota / auth / no-results 
 is unit-tested offline. The SauceNAO fallback landed after that and has **not** been
 verified live.
 
-**@-mention chat is built and works live** (`chat_agent.py`, `MENTION_AGENT_PLAN.md`).
+**@-mention chat is built and works live** (`chat_agent.py`, `plans/MENTION_AGENT_PLAN.md`).
 394 offline checks (127 `chat_agent`, 163 `bot.py` wiring against faked messages, 36
 `web_search`, 68 `page_reader`), plus both paths verified end-to-end against the real API
 — text and an image correctly described, $0.0001–0.002 a reply. `agent_context.md` is read
@@ -214,7 +221,8 @@ a test server is the next thing to do.
 
 ## Backlog
 
-Designed but unbuilt proposals live in `IDEAS.md`, with their rejected alternatives.
+Unbuilt proposals are listed in `IDEAS.md`; the ones worth building have a plan in
+`plans/`, which is where the design and its rejected alternatives live.
 
 - Further engines (Yandex, TinEye) behind the same normalised match shape.
 - Per-server API key configuration.
