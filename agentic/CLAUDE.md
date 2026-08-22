@@ -146,12 +146,28 @@ behind it, not the runner itself.
 - **The reply prompt says outright that nobody asked.** Without `AMBIENT_CONTEXT_NOTE` the
   model reads the transcript as a question put to it and answers like a summoned assistant
   — greeting the channel, summarising, offering more help. The persona alone doesn't fix it.
+- **Every ambient refusal logs at INFO except one.** A quiet channel with no log line
+  reads as a broken feature, so the eligibility refusals, the in-flight skip and the
+  `AmbientLimits` reasons are all INFO. Only "not an enabled channel" stays DEBUG — it
+  fires on every message in every channel of every guild. The startup line names the
+  enabled channel ids for the same reason: a count can't be checked against a config.
+- **The judge scores against `AMBIENT_SELF_SUMMARY`, not `agent_context.md`.** The gate
+  deliberately never sees the persona, so that one sentence is the whole self-description
+  it reasons from — and a narrow one costs replies. A summary naming only image lookups had
+  the gate scoring a message about the bot at 0, giving "no valid image question" as its
+  reason. It is the highest-leverage calibration knob there is, ahead of the threshold.
+- **The verdict format puts `SCORE` first.** `GATE_MAX_TOKENS` is 40, so a model that
+  overruns on `REASON` loses whatever comes after it. Score first means a truncated reply
+  costs the explanation; reason first means it costs the decision, and `parse_verdict`
+  fails closed to 0 — silence that looks exactly like a considered 0.
 - **The gate is text-only and the reply is not.** `openrouter/free` works for the judge at
   zero cost precisely because no image is sent; the no-free-vision finding above still
   binds the reply, which is why that side uses auto routing.
 - **`silent=True` and `mention_author=False` on every ambient post.** The client sets
   `replied_user=True`, so a reference without the override pings someone who never asked.
-  A reply to the newest message is visual noise, so that case degrades to a plain `send`.
+  A reply to the newest message is visual noise, so that case degrades to a plain `send` —
+  which then carries an `<@id>` prefix from `addressee`, since without a reply header
+  nothing else says who the bot is talking to. `silent=True` keeps that from buzzing anyone.
 - **Ambient failures are silent, deliberately.** A user who @-mentions the bot deserves "my
   API key isn't working"; a channel that never asked deserves nothing. Both classify
   through `describe_chat_failure`; only the mention path posts the string.
@@ -234,6 +250,9 @@ behind it, not the runner itself.
 - **SauceNAO free tier is 100/day, 6 per 30s** — cheaper to exercise, but still shared.
 - **OpenRouter calls bill per request** (~$0.0001–0.0008). Cheap, but check before running
   a loop. Offline checks cover the request body, error mapping and throttle without a key.
+- **Every check script ends in `sys.exit()`, so anything appended after it never runs.**
+  It exits 0 while the new checks sit there dead, and the total moves by exactly nothing.
+  Add checks above the summary print.
 - **Checks live in `agentic/checks/`** — see its README. No pytest; plain scripts that
   print `N passed, M failed`. Run them from the repo root with the venv python and no
   arguments. Add to them rather than writing throwaway scripts elsewhere.

@@ -96,6 +96,7 @@ from ambient import (
     AmbientLimits,
     ChannelBuffer,
     MessageRecord,
+    addressee,
     build_reply_history,
     count_newer,
     images_for_reply,
@@ -475,15 +476,17 @@ def log_ambient_status() -> None:
         log.warning("AMBIENT_ENABLED is set but AMBIENT_CHANNELS is empty, so nothing is read")
         return
     log.info(
-        "Ambient replies %s in %d channel(s): gate %s at threshold %d, at most %d an "
-        "hour and no sooner than %ds apart. Unaddressed messages in those channels are "
-        "sent to the model.",
+        "Ambient replies %s in %d channel(s) (%s): gate %s at threshold %d, at most %d an "
+        "hour and no sooner than %ds apart, after a %ds debounce. Unaddressed messages in "
+        "those channels are sent to the model.",
         "ON" if AMBIENT_MODE == "reply" else "in observe mode (nothing is posted)",
         len(AMBIENT_CHANNELS),
+        ", ".join(str(c) for c in sorted(AMBIENT_CHANNELS)),
         " then ".join(AMBIENT_GATE_MODEL),
         AMBIENT_THRESHOLD,
         AMBIENT_MAX_PER_HOUR,
         AMBIENT_COOLDOWN_SECONDS,
+        AMBIENT_DEBOUNCE_SECONDS,
     )
 
 
@@ -1423,35 +1426,44 @@ def observe_ambient(message: discord.Message) -> MessageRecord | None:
         return None
     # Nothing is held for a channel it will never speak in.
     if message.channel.id not in AMBIENT_CHANNELS:
+        log.debug("Ambient: %s is not an enabled channel", message.channel.id)
         return None
     record = to_record(message)
     ambient_buffer.add(message.channel.id, record)
     return record
 
 
-def ambient_eligible(message: discord.Message, record: MessageRecord) -> bool:
-    channel = message.channel
-    if channel.id not in AMBIENT_CHANNELS:
-        return False
+def ambient_eligible(message: discord.Message, record: MessageRecord) -> str | None:
+    """None to proceed, otherwise the reason, shaped like AmbientLimits.allow."""
+    if message.channel.id not in AMBIENT_CHANNELS:
+        return "channel not enabled"
     # A DM is a conversation of two; an uninvited third voice is worse there.
     if message.guild is None:
-        return False
+        return "a DM"
     # Other bots are transcript, never a trigger: two of these would loop.
     if message.author.bot:
-        return False
-    return is_readable(record)
+        return "another bot"
+    if not is_readable(record):
+        return "nothing in it I can read"
+    return None
 
 
 def consider_ambient(message: discord.Message, record: MessageRecord | None) -> None:
     """Trailing debounce with a deadline: each message pushes the evaluation back
     until the burst ends, but a channel that never goes quiet still gets judged."""
-    if record is None or not ambient_eligible(message, record):
+    if record is None:
         return
 
     channel_id = message.channel.id
+    refusal = ambient_eligible(message, record)
+    if refusal:
+        log.info("Ambient: not considering a message in %s - %s", channel_id, refusal)
+        return
+
     # One running evaluation per channel; how far the conversation has since
     # moved is AMBIENT_STALE_MESSAGES' decision, not this one's.
     if channel_id in ambient_running:
+        log.info("Ambient: already thinking in %s, leaving this message to it", channel_id)
         return
 
     pending = ambient_tasks.get(channel_id)
@@ -1502,7 +1514,7 @@ async def run_ambient(channel: discord.abc.Messageable) -> None:
 
     refusal = ambient_limits.allow(channel_id, records)
     if refusal:
-        log.debug("Ambient: quiet in %s - %s", channel_id, refusal)
+        log.info("Ambient: quiet in %s - %s", channel_id, refusal)
         return
 
     started = time.monotonic()
@@ -1614,6 +1626,11 @@ async def post_ambient(
             return
         except discord.HTTPException as exc:
             log.info("Ambient: target message is gone (%s), sending plainly", exc)
+
+    # No reply header here, so the mention is the only cue to who it is for.
+    who = addressee(records, target, bot.user.id if bot.user else 0)
+    if who is not None:
+        text = f"<@{who}> {text}"[:DISCORD_MESSAGE_LIMIT]
 
     try:
         await channel.send(text, silent=True)

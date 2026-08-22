@@ -121,7 +121,12 @@ prompt = A.build_judge_prompt(convo)
 check("the prompt carries the transcript", "anyone know where this is from" in prompt)
 check("the prompt states the bar is high", "bar is high" in prompt)
 check("the prompt names the transcript untrusted", "untrusted" in prompt)
-check("the prompt asks for reason before score", prompt.index("REASON") < prompt.index("SCORE"))
+# A truncated reply must still carry the decision, so SCORE leads the format.
+check("the prompt asks for score before reason", prompt.index("SCORE") < prompt.index("REASON"))
+check("the prompt says being named is enough on its own",
+      "is on its own enough" in prompt)
+check("the prompt refuses an image-only reading",
+      "not only an image tool" in prompt)
 check("the prompt refuses files it can't open", "cannot open" in prompt)
 check("the self summary is substituted",
       "a test bot" in A.build_judge_prompt(convo, "a test bot"))
@@ -343,7 +348,8 @@ check("an unlisted channel stays empty", B.ambient_buffer.size(OTHER) == 0)
 check("another bot's message is buffered", B.observe_ambient(Msg(author_bot=True)) is not None)
 
 def eligible(msg):
-    return B.ambient_eligible(msg, B.to_record(msg))
+    """None from ambient_eligible means proceed, so eligibility is its absence."""
+    return B.ambient_eligible(msg, B.to_record(msg)) is None
 
 check("a human in an enabled channel is eligible", eligible(Msg()))
 check("another bot never schedules a gate", not eligible(Msg(author_bot=True)))
@@ -564,6 +570,29 @@ B.ambient_limits = A.AmbientLimits((), 0, 10)
 B.bot.session = Failing()
 asyncio.run(B.run_ambient(channel))
 check("an opted-out channel never reaches the gate", channel.sent == [])
+
+# Refusals are named so the log says which guard fired, like AmbientLimits.allow.
+check("an unlisted channel names its refusal",
+      B.ambient_eligible(Msg(channel=Channel(OTHER)), B.to_record(Msg())) == "channel not enabled")
+check("another bot names its refusal",
+      B.ambient_eligible(Msg(author_bot=True), B.to_record(Msg())) == "another bot")
+check("an unreadable message names its refusal",
+      B.ambient_eligible(Msg("", attachments=[mov]), B.to_record(Msg("", attachments=[mov])))
+      == "nothing in it I can read")
+
+# --- addressee ---
+BOT = 99
+convo2 = [rec("alpha", 1, "first"), rec("bravo", 2, "second"), rec("me", BOT, "mine", is_bot=True)]
+check("the judge's target is the addressee", A.addressee(convo2, 1, BOT) == 1)
+check("no target falls back to the last human", A.addressee(convo2, None, BOT) == 2)
+check("the bot never addresses itself", A.addressee(convo2, 3, BOT) == 2)
+check("an out-of-range target falls back", A.addressee(convo2, 99, BOT) == 2)
+check("nobody to address is None", A.addressee([], None, BOT) is None)
+# Another bot is transcript, so it is never who the reply is addressed to.
+check("a targeted other bot is not addressed",
+      A.addressee([rec("alpha", 1, "hi"), rec("elsebot", 8, "beep", is_bot=True)], 2, BOT) == 1)
+check("a channel of only bots has no addressee",
+      A.addressee([rec("me", BOT, "mine", is_bot=True)], None, BOT) is None)
 
 print(f"ambient: {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
