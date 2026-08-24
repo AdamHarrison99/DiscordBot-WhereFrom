@@ -170,9 +170,12 @@ check("a voice note alone reaches the model",
       calls == [(f"user1: {B.DESCRIBE_AUDIO_QUESTION}", [], [])])
 check("the clip travels with it", audio_calls == [[("https://cdn/v.ogg", "ogg")]])
 
-# A tool list makes some models deny the audio, so audio-only goes without one.
+# Audio keeps the tools: the refusals turned out to be intermittent and
+# model-dependent, not caused by the tool list.
 _asked = {}
+_seen = []
 async def spy_ask(session, context, question, **kw):
+    _seen.append((context, question, kw))
     _asked.update(kw)
     return CA.ChatReply("ok", "m/1", 0.0)
 # answer_mention hands bot.session to ask; the spy ignores it, but it must exist.
@@ -182,60 +185,20 @@ _real_fetch, B.fetch_audio = B.fetch_audio, lambda clips: _fake_fetch(clips)
 async def _fake_fetch(clips): return [("BASE64", f) for _, f in clips]
 
 asyncio.run(real_answer_mention("q", [], None, "someone", [("https://cdn/v.ogg", "ogg")]))
-check("audio alone offers no tools", _asked["tools"] == ())
-check("audio alone passes no tool runner", _asked["tool_runner"] is None)
-check("the clip still goes", _asked["audio"] == [("BASE64", "ogg")])
+check("a clip takes one call", len(_seen) == 1)
+check("audio keeps the tools", _asked["tools"] != ())
+check("audio keeps the runner", _asked["tool_runner"] is not None)
+check("the clip travels with them", _asked["audio"] == [("BASE64", "ogg")])
 
-# Both at once: the clip is described first, then travels as text so the image
-# can still have its tools.
-_seen = []
-async def recording_ask(session, context, question, **kw):
-    _seen.append((context, question, kw))
-    _asked.update(kw)
-    return CA.ChatReply("a dog barking", "m/1", 0.0)
-B.ask = recording_ask
-_asked.clear()
+# Both at once travel in one call, tools and all.
+_seen.clear(); _asked.clear()
 asyncio.run(real_answer_mention("q", ["https://cdn/x.png"], None, "someone",
                                 [("https://cdn/v.ogg", "ogg")]))
-check("both attachments cost two calls", len(_seen) == 2)
-check("the first call is the description", _seen[0][1] == B.AUDIO_DESCRIBE_QUESTION)
-check("the first call carries the clip", _seen[0][2]["audio"] == [("BASE64", "ogg")])
-check("the first call has no tools", not _seen[0][2].get("tools"))
-check("what was heard reaches the second call", "a dog barking" in _seen[1][1])
-check("the second call sends no audio", _seen[1][2]["audio"] == ())
-check("an image keeps the tools", _asked["tools"] != ())
-check("an image keeps the runner", _asked["tool_runner"] is not None)
-
-# A failed description must not cost the answer.
-_seen.clear()
-async def failing_ask(session, context, question, **kw):
-    if not _seen:
-        _seen.append("described")
-        raise CA.ChatUnavailable("upstream is down")
-    _seen.append((context, question, kw))
-    return CA.ChatReply("ok", "m/1", 0.0)
-B.ask = failing_ask
-answer, _ = asyncio.run(real_answer_mention("q", ["https://cdn/x.png"], None, "someone",
-                                            [("https://cdn/v.ogg", "ogg")]))
-check("a failed description still answers", answer == "ok")
-check("and adds no audio note", "contains:" not in _seen[1][1])
-
-# The description is model output made from someone's audio, so it can't forge
-# structure in the question it is folded into.
-_seen.clear()
-async def chatty_ask(session, context, question, **kw):
-    _seen.append((context, question, kw))
-    if len(_seen) == 1:
-        return CA.ChatReply("line one\nline two" + "x" * 900, "m/1", 0.0)
-    return CA.ChatReply("ok", "m/1", 0.0)
-B.ask = chatty_ask
-asyncio.run(real_answer_mention("q", ["https://cdn/x.png"], None, "someone",
-                                [("https://cdn/v.ogg", "ogg")]))
-_folded = _seen[1][1]
-check("a newline in the description is flattened", "line one\nline two" not in _folded)
-check("the description is capped", len(_folded) < 900)
-check("the description still arrives", "line one" in _folded)
-B.ask = recording_ask
+check("an image and a clip take one call", len(_seen) == 1)
+check("the clip is not described into the question", _seen[0][1] == "q")
+check("both attachments travel together",
+      _asked["audio"] == [("BASE64", "ogg")] and _asked["image_urls"] == ["https://cdn/x.png"])
+check("and they keep the tools", _asked["tools"] != ())
 
 _asked.clear()
 asyncio.run(real_answer_mention("q", [], None, "someone"))
@@ -389,10 +352,12 @@ check("no link recorded when the search fails", B.SourceFinder("u", "t").top_lin
 def reload_models(text="", image="", base="openrouter/auto"):
     os.environ["OPENROUTER_TEXT_MODEL"] = text
     os.environ["OPENROUTER_MEDIA_MODEL"] = image
+    os.environ["OPENROUTER_IMAGE_MODEL"] = ""
+    os.environ["OPENROUTER_AUDIO_MODEL"] = ""
     os.environ["OPENROUTER_MODEL"] = base
     import importlib
     m = importlib.reload(B)
-    return m.OPENROUTER_TEXT_MODEL, m.OPENROUTER_MEDIA_MODEL
+    return m.OPENROUTER_TEXT_MODEL, m.OPENROUTER_IMAGE_MODEL
 
 FREE = B.FREE_ROUTER_MODEL
 check("blank text model falls back to auto", reload_models()[0] == ("openrouter/auto", FREE))
@@ -435,6 +400,36 @@ check("the text chain still does",
       reload_models(text="a/one")[0] == ("a/one", FREE))
 check("an image chain of nothing but free keeps free",
       reload_models(image=FREE)[1] == (FREE,))
+
+# --- pictures and clips are configured apart ---
+def reload_split(media="", image="", audio="", base="openrouter/auto"):
+    os.environ["OPENROUTER_TEXT_MODEL"] = ""
+    os.environ["OPENROUTER_MEDIA_MODEL"] = media
+    os.environ["OPENROUTER_IMAGE_MODEL"] = image
+    os.environ["OPENROUTER_AUDIO_MODEL"] = audio
+    os.environ["OPENROUTER_MODEL"] = base
+    import importlib
+    m = importlib.reload(B)
+    return m.OPENROUTER_IMAGE_MODEL, m.OPENROUTER_AUDIO_MODEL
+
+check("both kinds inherit the shared media setting",
+      reload_split(media="m/one") == (("m/one",), ("m/one",)))
+check("each kind can override it",
+      reload_split(media="m/one", image="i/one", audio="a/one") == (("i/one",), ("a/one",)))
+check("audio can differ while pictures inherit",
+      reload_split(media="m/one", audio="a/one") == (("m/one",), ("a/one",)))
+check("both fall back to OPENROUTER_MODEL",
+      reload_split(base="b/one") == (("b/one",), ("b/one",)))
+check("neither kind gets the free router",
+      FREE not in reload_split(media="m/one", image="i/one", audio="a/one")[0] + reload_split()[1])
+
+# A clip is the narrower capability, so it picks the model when both arrive.
+_img, _aud = reload_split(image="i/one", audio="a/one", base="b/one")
+check("a clip picks the audio model", B.model_for([], [("DATA", "ogg")]) == _aud)
+check("a picture picks the image model", B.model_for(["https://cdn/x.png"], []) == _img)
+check("both together pick the audio model",
+      B.model_for(["https://cdn/x.png"], [("DATA", "ogg")]) == _aud)
+check("neither picks the text model", B.model_for([], []) == B.OPENROUTER_TEXT_MODEL)
 reload_models()
 
 # --- /forget clears the channel's memory ---

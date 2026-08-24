@@ -355,17 +355,16 @@ SAUCENAO_MIN_SIMILARITY = env_float("SAUCENAO_MIN_SIMILARITY", DEFAULT_MIN_SIMIL
 
 # Optional. Without it the bot ignores @-mentions exactly as it did before.
 OPENROUTER_API_KEY = env_str("OPENROUTER_API_KEY")
-if "OPENROUTER_IMAGE_MODEL" in os.environ and "OPENROUTER_MEDIA_MODEL" not in os.environ:
-    os.environ["OPENROUTER_MEDIA_MODEL"] = os.environ["OPENROUTER_IMAGE_MODEL"]
-    log.warning("OPENROUTER_IMAGE_MODEL is now OPENROUTER_MEDIA_MODEL - rename it in .env")
-
 _MODEL_SETTING = env_str("OPENROUTER_MODEL", AUTO_ROUTER_MODEL)
 OPENROUTER_MODEL = env_models("OPENROUTER_MODEL", AUTO_ROUTER_MODEL)
 # Per-kind overrides. Unset falls back to OPENROUTER_MODEL, i.e. auto routing.
 OPENROUTER_TEXT_MODEL = env_models("OPENROUTER_TEXT_MODEL", _MODEL_SETTING)
-# No free fallback here: openrouter/free has no vision endpoint, so it can only
-# turn a busy paid model into a misleading "backend isn't configured" error.
-OPENROUTER_MEDIA_MODEL = env_models("OPENROUTER_MEDIA_MODEL", _MODEL_SETTING, free_last=False)
+# OPENROUTER_MEDIA_MODEL sets both at once; either kind can still override it.
+_MEDIA_SETTING = env_str("OPENROUTER_MEDIA_MODEL", _MODEL_SETTING)
+# No free fallback on either: openrouter/free has no vision endpoint, so it can
+# only turn a busy paid model into a misleading "backend isn't configured" error.
+OPENROUTER_IMAGE_MODEL = env_models("OPENROUTER_IMAGE_MODEL", _MEDIA_SETTING, free_last=False)
+OPENROUTER_AUDIO_MODEL = env_models("OPENROUTER_AUDIO_MODEL", _MEDIA_SETTING, free_last=False)
 OPENROUTER_MAX_TOKENS = env_int("OPENROUTER_MAX_TOKENS", DEFAULT_MAX_TOKENS)
 # Dollars per million tokens. Unset means no ceiling; too low leaves no endpoints.
 # Blank and 0 are different: 0 is a real ceiling meaning free-only.
@@ -443,17 +442,6 @@ RATE_LIMITED_EMOJI = "\N{HOURGLASS}"
 DESCRIBE_IMAGE_QUESTION = "What's in this image?"
 DESCRIBE_AUDIO_QUESTION = "What's in this audio?"
 
-AUDIO_DESCRIBE_SYSTEM = "You describe audio. You answer with the content only, no preamble."
-AUDIO_DESCRIBE_QUESTION = (
-    "Say what this audio contains. If it is speech, give the words. Otherwise describe "
-    "the sound in one or two sentences. Do not add commentary."
-)
-# Long enough for a spoken sentence or two, short enough to leave room for history.
-MAX_HEARD_CHARS = 500
-
-# The clip can't ride along with the tools, so its description goes in the text.
-AUDIO_HEARD_TEMPLATE = "\n\n(An audio clip was also attached. It contains: {heard})"
-
 
 def resolve_agent_context() -> str | None:
     """Returns the system prompt, or None if the chat feature stays off."""
@@ -482,10 +470,11 @@ def resolve_agent_context() -> str | None:
 
     # OPENROUTER_MODEL is only a default; both overrides may leave it unused.
     log.info(
-        "@-mention replies enabled: text via %s, images via %s, context from %s (~%d "
-        "tokens, plus a %d budget for history and the question)",
+        "@-mention replies enabled: text via %s, images via %s, audio via %s, context "
+        "from %s (~%d tokens, plus a %d budget for history and the question)",
         " then ".join(OPENROUTER_TEXT_MODEL),
-        " then ".join(OPENROUTER_MEDIA_MODEL),
+        " then ".join(OPENROUTER_IMAGE_MODEL),
+        " then ".join(OPENROUTER_AUDIO_MODEL),
         path,
         tokens,
         MAX_CONTEXT_TOKENS,
@@ -1394,27 +1383,11 @@ def describe_chat_failure(exc: BaseException) -> str:
     return "Something went wrong answering that."
 
 
-async def describe_audio(clips: Sequence[tuple[str, str]]) -> str:
-    """One tool-free call whose only job is to hear the clip. Returns "" on any
-    failure - the answer is worth giving without it."""
-    try:
-        reply = await ask(
-            bot.session,
-            AUDIO_DESCRIBE_SYSTEM,
-            AUDIO_DESCRIBE_QUESTION,
-            api_key=OPENROUTER_API_KEY,
-            model=OPENROUTER_MEDIA_MODEL,
-            max_tokens=OPENROUTER_MAX_TOKENS,
-            max_price=OPENROUTER_MAX_PRICE,
-            max_context_tokens=MAX_CONTEXT_TOKENS,
-            audio=clips,
-        )
-    except Exception as exc:
-        log.info("Couldn't describe the audio: %s", describe_chat_failure(exc))
-        return ""
-    log.info("Described a clip in %d chars via %s, cost $%.6f",
-             len(reply.text), reply.model or "?", reply.cost)
-    return reply.text.strip()
+def model_for(image_urls: Sequence[str], clips: Sequence[tuple[str, str]]) -> tuple[str, ...]:
+    """A clip is the narrower capability, so it picks the model when both arrive."""
+    if clips:
+        return OPENROUTER_AUDIO_MODEL
+    return OPENROUTER_IMAGE_MODEL if image_urls else OPENROUTER_TEXT_MODEL
 
 
 async def answer_mention(
@@ -1427,21 +1400,10 @@ async def answer_mention(
     """Returns (reply text, worth remembering). Errors are returned, not raised,
     but never enter the conversation history."""
     clips = await fetch_audio(audio)
-    model = OPENROUTER_MEDIA_MODEL if image_urls or clips else OPENROUTER_TEXT_MODEL
+    model = model_for(image_urls, clips)
     tools = AgentTools(
         image_urls[0] if image_urls else None, who, bool(URL_PATTERN.search(question))
     )
-    # An image needs the tools and the clip can't be sent alongside them, so the
-    # clip is described first and travels as text instead.
-    if clips and image_urls:
-        # Flattened: this is model output built from someone's audio, and a
-        # newline in it would forge structure in the question it lands in.
-        heard = flatten(await describe_audio(clips), MAX_HEARD_CHARS)
-        if heard:
-            question += AUDIO_HEARD_TEMPLATE.format(heard=heard)
-        clips = ()
-    # A tool list makes some models deny the audio they were just billed for.
-    offered = () if clips else tools.definitions
 
     try:
         reply = await ask(
@@ -1455,8 +1417,8 @@ async def answer_mention(
             max_price=OPENROUTER_MAX_PRICE,
             max_context_tokens=MAX_CONTEXT_TOKENS,
             history=history or [],
-            tools=offered,
-            tool_runner=tools if offered else None,
+        tools=tools.definitions,
+        tool_runner=tools,
             max_tool_rounds=AGENT_TOOL_ROUNDS,
             audio=clips,
         )
@@ -1737,7 +1699,7 @@ async def compose_ambient(
                 f"{AGENT_CONTEXT}\n\n{AMBIENT_CONTEXT_NOTE}",
                 REPLY_INSTRUCTION,
                 api_key=OPENROUTER_API_KEY,
-                model=OPENROUTER_MEDIA_MODEL if images or clips else OPENROUTER_TEXT_MODEL,
+                model=model_for(images, clips),
                 max_tokens=OPENROUTER_MAX_TOKENS,
                 image_urls=images,
                 max_price=OPENROUTER_MAX_PRICE,

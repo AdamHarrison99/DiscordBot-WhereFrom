@@ -157,15 +157,21 @@ behind it, not the runner itself.
   `.ogg`. Both media models accept audio; `openrouter/free` is not in that chain anyway.
   A clip over the cap is dropped at `audio_in`, so it counts as an unopenable file rather
   than as audio the bot will claim to have heard.
-- **A tool list makes some models deny audio they were just billed for.** Verified live
-  2026-08-24 on `google/gemini-2.5-flash-lite`: the same request with `tools` attached
-  answers "I can't listen to audio", and without them describes the clip — `audio_tokens`
-  is 25 either way, so it heard it and refused anyway. `google/gemini-2.5-flash` is fine.
-  Images never trip it, only audio. `answer_mention` therefore offers no tools when a clip
-  is the only attachment. **A message carrying both takes two calls**: `describe_audio` hears
-  the clip tool-free, its answer goes into the question as text, and the main call keeps the
-  image and the whole tool list. A failed description is dropped rather than raised — the
-  answer is worth giving without it.
+- **Audio refusals are intermittent and track model strength, not the request.** A model
+  takes the clip, is billed for it (`audio_tokens` is present) and answers that it cannot
+  listen. Measured 2026-08-24 over 8s of speech, 4 trials an arm: `google/gemini-2.5-flash`
+  answered 7 of 8, `google/gemini-2.5-flash-lite` 4 of 8, and **a tool list changed
+  neither** — flash-lite refuses without tools as readily as with them, and transcribes
+  the clip perfectly while holding the full list. An earlier single trial on half a second
+  of a sine tone read that coin flip as a rule, so tools were withheld from audio for a
+  while; they need not be. Prefer the stronger model and re-measure any new id with
+  `agentic/tools/probe_media.py` — the catalogue cannot tell you, since a model that
+  refuses advertises the same `input_modalities` and the same `tools` support as one that
+  does not.
+- **A tool list does let a model invent an audio tool.** flash-lite asked for a
+  `read_audio` that was never offered and returned no content with it. `AgentTools`
+  answers "no such tool" and the model gets another round, so it costs a round rather
+  than the reply — but a chain whose last round is spent that way returns empty.
 - **The text part has to say the attachment is audio** (`AUDIO_NOTE`). Without it the model
   calls the clip "an image file" and reaches for `find_image_source`, since the persona is
   image-shaped and nothing else in the request says otherwise.
@@ -255,10 +261,15 @@ behind it, not the runner itself.
   says which ids it dropped), **an invalid model id is a hard 400, not a skipped entry**,
   and `route: "fallback"` is neither needed nor helpful (it 429'd where the bare array
   succeeded).
-  **`OPENROUTER_MEDIA_MODEL` is the exception** (`free_last=False`): a router with no vision
+  **The media chains are the exception** (`free_last=False`): a router with no vision
   endpoint can only turn a busy paid model into `ChatNoEndpoints`, which reads to the user
-  as "the admin misconfigured me". It is dropped from that chain even when inherited from
-  `OPENROUTER_MODEL` — unless it is all that chain has, since nothing can serve an empty one.
+  as "the admin misconfigured me". It is dropped from those chains even when inherited from
+  `OPENROUTER_MODEL` — unless it is all a chain has, since nothing can serve an empty one.
+  **Pictures and clips are configured apart** (`OPENROUTER_IMAGE_MODEL`,
+  `OPENROUTER_AUDIO_MODEL`, both defaulting to `OPENROUTER_MEDIA_MODEL`): a model can see
+  perfectly and still answer that it cannot listen, so the cheap one can keep the images
+  while audio pays for a stronger one. `model_for` picks, and a clip wins over a picture
+  when both arrive — audio is the narrower capability.
 - **A leading `~` is OpenRouter's "latest" alias and is part of the id.**
   `~deepseek/deepseek-v4-flash-latest` resolves to a dated build; stripping the tilde
   gives "is not a valid model ID". Don't "clean" it out of a config value.
@@ -271,6 +282,28 @@ behind it, not the runner itself.
 - **The image model needs tool calling as well as vision.** `google/gemini-2.5-flash-image`
   has vision and no `tools`, so it would take the mention path and silently lose
   `find_image_source`. Check `supported_parameters` before pinning one.
+- **Some newer endpoints refuse `reasoning: {"enabled": false}` outright.**
+  `google/gemini-3.7-flash` — and so `~google/gemini-flash-latest`, which resolves to it —
+  answers every request with a hard 400: reasoning is mandatory and cannot be disabled.
+  `google/gemini-3.1-flash-lite` is worse — it accepts the flag, reasons anyway, and spends
+  the whole `max_tokens` budget doing it, so an image request comes back with `content:
+  null` and `finish_reason: "length"`. That is the empty-reply trap the flag exists to
+  prevent, back again on a model that ignores it. Probe an id before adopting it.
+- **Some models emit tool-call scaffolding as ordinary text.** `google/gemini-3.1-flash-lite`
+  answered an image with a literal `tool_code print(find_image_source(...))` line — around a
+  **Discord CDN URL it invented**, snowflakes and all — and `thinkingmachines/inkling-small`
+  returned a raw function-call JSON blob the same way. There is no `tool_calls` field to
+  parse; it is content, and `answer_mention` would post it verbatim. Seen on every trial for
+  3.1-flash-lite, occasionally on the others.
+- **A model that passes every capability probe can still be unusable on tone.**
+  `thinkingmachines/inkling-small` handles audio, vision and tool calls cleanly at close to
+  the cheapest tier, and worked slurs into most of its replies under the same persona that
+  the Gemini models answer politely on — including replies to a plain colour-swatch image.
+  Capability probes measure capability; read what a candidate actually says before shipping
+  it to a channel with people in it.
+- **`audio_tokens` is not a universal signal.** Gemini itemises it, `xiaomi/mimo-v2.5` and
+  `thinkingmachines/inkling-small` report 0 while transcribing the clip correctly. Absence
+  proves nothing about whether the audio arrived.
 - **Reasoning tokens are billed out of `max_tokens`.** A thinking model will spend the
   whole budget and return empty `content` with `reasoning` populated. Every request sends
   `reasoning: {"enabled": false}`; that's what fixed the intermittent empty replies.
