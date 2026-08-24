@@ -41,12 +41,19 @@ MAX_RECORD_CHARS = 200
 # back is rarely the one being discussed.
 MAX_REPLY_IMAGES = 2
 
+# Audio is billed by duration, so the reply listens to one clip at most.
+MAX_REPLY_AUDIO = 1
+
 MODES = ("observe", "reply")
 
 IMAGE_MARK = "[image attached]"
+AUDIO_MARK = "[voice message or audio clip attached]"
 OTHER_FILE_MARK = "[attached a file I can't open]"
 
 CONTROL_CHARS = re.compile(r"[\r\n\t\x00-\x1f]")
+
+# The ambient reply is offered no tools, so a link is a page it cannot open.
+LINK = re.compile(r"https?://\S+")
 
 
 class MessageRecord(NamedTuple):
@@ -57,9 +64,11 @@ class MessageRecord(NamedTuple):
     image_urls: tuple[str, ...]
     message_id: int
     at: float
-    # Video, audio, documents. Nothing here can read them, so they are marked
+    # Video and documents. Nothing here can read them, so they are marked
     # rather than described, and never fetched.
     other_files: bool = False
+    # (url, format) per clip, fetched only if the bot decides to answer.
+    audio: tuple[tuple[str, str], ...] = ()
 
 
 class Verdict(NamedTuple):
@@ -183,8 +192,8 @@ Do NOT reply when:
 - it is a joke or banter that needs no third party
 - the bot spoke recently
 - the bot would only be agreeing, acknowledging, or restating
-- the message is about a video, an audio clip or a document - the bot can read text
-  and see images, nothing else, and must not offer to look at a file it cannot open
+- the message is about a video or a document - the bot can read text, see images and
+  listen to audio, nothing else, and must not offer to open a file it cannot
 
 Reply only when:
 - the bot is named, discussed, or spoken to, however indirectly - being talked
@@ -212,6 +221,8 @@ def said(record: MessageRecord) -> str:
     parts = [flatten(record.text)]
     if record.image_urls:
         parts.append(IMAGE_MARK)
+    if record.audio:
+        parts.append(AUDIO_MARK)
     if record.other_files:
         parts.append(OTHER_FILE_MARK)
     return " ".join(part for part in parts if part)
@@ -285,7 +296,7 @@ Nobody mentioned you, replied to you, or ran a command. You have been reading th
 
 So write like someone stepping into a conversation already in progress, not like an assistant answering a query. Nobody is waiting on you, and nothing obliges you to be comprehensive.
 
-You can read text and see images. You cannot open videos, audio or documents - if one is mentioned, say nothing about its contents."""
+You can read text, see images and listen to audio clips. You cannot open videos or documents - if one is mentioned, say nothing about its contents."""
 
 REPLY_INSTRUCTION = (
     "Say the one thing worth adding, in a sentence or two. Don't greet anyone, don't "
@@ -336,6 +347,20 @@ def addressee(records: Sequence[MessageRecord], target: int | None, bot_id: int)
     return None
 
 
+def audio_for_reply(
+    records: Sequence[MessageRecord], target: int | None = None
+) -> list[tuple[str, str]]:
+    """The targeted message's clip, else the most recent one on offer."""
+    if target is not None and 1 <= target <= len(records):
+        chosen = records[target - 1]
+        if chosen.audio:
+            return list(chosen.audio[:MAX_REPLY_AUDIO])
+    for record in reversed(records):
+        if record.audio:
+            return list(record.audio[:MAX_REPLY_AUDIO])
+    return []
+
+
 def count_newer(records: Sequence[MessageRecord], message_id: int | None) -> int:
     """How far the conversation has moved since a snapshot. Counted by id rather
     than by buffer length, which stops growing once the deque is full."""
@@ -344,10 +369,19 @@ def count_newer(records: Sequence[MessageRecord], message_id: int | None) -> int
     return sum(1 for record in records if record.message_id > message_id)
 
 
+def carries_unreadable(record: MessageRecord) -> bool:
+    """Anything the bot has no way to open: a file it can't read, or a link it
+    has no tool to follow. Images don't count - it can see those."""
+    return record.other_files or bool(LINK.search(flatten(record.text)))
+
+
 def is_readable(record: MessageRecord) -> bool:
-    """A lone video or document is context, not a prompt - it stays in the buffer
-    but it doesn't buy a gate call, because there is nothing in it to judge."""
-    return bool(flatten(record.text) or record.image_urls)
+    """A lone video, document or link is context, not a prompt - it stays in the
+    buffer but it doesn't buy a gate call, because there is nothing to judge."""
+    if record.image_urls or record.audio:
+        return True
+    # Punctuation left behind by a stripped link isn't something said either.
+    return any(ch.isalnum() for ch in LINK.sub(" ", flatten(record.text)))
 
 
 def resolve_mode(raw: str) -> str:

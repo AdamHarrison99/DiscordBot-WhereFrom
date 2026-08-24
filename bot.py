@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
 import contextlib
 import json
 import logging
@@ -14,6 +15,7 @@ import queue
 import re
 import sys
 import time
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
@@ -73,8 +75,9 @@ from chat_agent import (
     ChatNoEndpoints,
     ChatRateLimited,
     ChatRefused,
-    MAX_FALLBACK_MODELS,
     ChatUnavailable,
+    MAX_AUDIO_CLIPS,
+    MAX_FALLBACK_MODELS,
     Conversation,
     MentionThrottle,
     ask,
@@ -97,7 +100,10 @@ from ambient import (
     ChannelBuffer,
     MessageRecord,
     addressee,
+    audio_for_reply,
     build_reply_history,
+    carries_unreadable,
+    flatten,
     count_newer,
     images_for_reply,
     is_readable,
@@ -349,13 +355,17 @@ SAUCENAO_MIN_SIMILARITY = env_float("SAUCENAO_MIN_SIMILARITY", DEFAULT_MIN_SIMIL
 
 # Optional. Without it the bot ignores @-mentions exactly as it did before.
 OPENROUTER_API_KEY = env_str("OPENROUTER_API_KEY")
+if "OPENROUTER_IMAGE_MODEL" in os.environ and "OPENROUTER_MEDIA_MODEL" not in os.environ:
+    os.environ["OPENROUTER_MEDIA_MODEL"] = os.environ["OPENROUTER_IMAGE_MODEL"]
+    log.warning("OPENROUTER_IMAGE_MODEL is now OPENROUTER_MEDIA_MODEL - rename it in .env")
+
 _MODEL_SETTING = env_str("OPENROUTER_MODEL", AUTO_ROUTER_MODEL)
 OPENROUTER_MODEL = env_models("OPENROUTER_MODEL", AUTO_ROUTER_MODEL)
 # Per-kind overrides. Unset falls back to OPENROUTER_MODEL, i.e. auto routing.
 OPENROUTER_TEXT_MODEL = env_models("OPENROUTER_TEXT_MODEL", _MODEL_SETTING)
 # No free fallback here: openrouter/free has no vision endpoint, so it can only
 # turn a busy paid model into a misleading "backend isn't configured" error.
-OPENROUTER_IMAGE_MODEL = env_models("OPENROUTER_IMAGE_MODEL", _MODEL_SETTING, free_last=False)
+OPENROUTER_MEDIA_MODEL = env_models("OPENROUTER_MEDIA_MODEL", _MODEL_SETTING, free_last=False)
 OPENROUTER_MAX_TOKENS = env_int("OPENROUTER_MAX_TOKENS", DEFAULT_MAX_TOKENS)
 # Dollars per million tokens. Unset means no ceiling; too low leaves no endpoints.
 # Blank and 0 are different: 0 is a real ceiling meaning free-only.
@@ -398,11 +408,30 @@ AMBIENT_COOLDOWN_SECONDS = env_int("AMBIENT_COOLDOWN_SECONDS", DEFAULT_COOLDOWN_
 AMBIENT_MAX_PER_HOUR = env_int("AMBIENT_MAX_PER_HOUR", DEFAULT_MAX_PER_HOUR, minimum=0)
 AMBIENT_BUFFER_MESSAGES = env_int("AMBIENT_BUFFER_MESSAGES", DEFAULT_BUFFER_MESSAGES)
 AMBIENT_STALE_MESSAGES = env_int("AMBIENT_STALE_MESSAGES", DEFAULT_STALE_MESSAGES, minimum=0)
+AMBIENT_STRICT_CONTENT = env_flag("AMBIENT_STRICT_CONTENT", False)
 AMBIENT_SELF_SUMMARY = env_str("AMBIENT_SELF_SUMMARY", DEFAULT_SELF_SUMMARY)
+
+AUDIO_ENABLED = env_flag("AUDIO_ENABLED", True)
+# Base64 inflates by a third, and the whole clip rides in the request body.
+AUDIO_MAX_BYTES = env_int("AUDIO_MAX_BYTES", 4_000_000)
 
 MAX_SHOWN_MATCHES = 4
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+AUDIO_TIMEOUT = aiohttp.ClientTimeout(total=15)
+AUDIO_CHUNK_BYTES = 64 * 1024
+
+# Extension to the format name OpenRouter wants. Discord voice notes are ogg.
+AUDIO_FORMATS = {
+    "mp3": "mp3", "wav": "wav", "ogg": "ogg", "oga": "ogg", "opus": "ogg",
+    "m4a": "m4a", "aac": "aac", "flac": "flac", "aiff": "aiff", "aif": "aiff",
+}
+AUDIO_MIME_FORMATS = {
+    "mpeg": "mp3", "mp3": "mp3", "wav": "wav", "x-wav": "wav", "ogg": "ogg",
+    "opus": "ogg", "mp4": "m4a", "x-m4a": "m4a", "aac": "aac", "flac": "flac",
+    "x-flac": "flac", "aiff": "aiff", "x-aiff": "aiff",
+}
 SAUCE_TRIGGERS = ("?sauce", "!sauce")
 
 DISCORD_MESSAGE_LIMIT = 2000
@@ -412,6 +441,18 @@ NO_QUESTION_REPLY = (
 )
 RATE_LIMITED_EMOJI = "\N{HOURGLASS}"
 DESCRIBE_IMAGE_QUESTION = "What's in this image?"
+DESCRIBE_AUDIO_QUESTION = "What's in this audio?"
+
+AUDIO_DESCRIBE_SYSTEM = "You describe audio. You answer with the content only, no preamble."
+AUDIO_DESCRIBE_QUESTION = (
+    "Say what this audio contains. If it is speech, give the words. Otherwise describe "
+    "the sound in one or two sentences. Do not add commentary."
+)
+# Long enough for a spoken sentence or two, short enough to leave room for history.
+MAX_HEARD_CHARS = 500
+
+# The clip can't ride along with the tools, so its description goes in the text.
+AUDIO_HEARD_TEMPLATE = "\n\n(An audio clip was also attached. It contains: {heard})"
 
 
 def resolve_agent_context() -> str | None:
@@ -444,7 +485,7 @@ def resolve_agent_context() -> str | None:
         "@-mention replies enabled: text via %s, images via %s, context from %s (~%d "
         "tokens, plus a %d budget for history and the question)",
         " then ".join(OPENROUTER_TEXT_MODEL),
-        " then ".join(OPENROUTER_IMAGE_MODEL),
+        " then ".join(OPENROUTER_MEDIA_MODEL),
         path,
         tokens,
         MAX_CONTEXT_TOKENS,
@@ -477,7 +518,7 @@ def log_ambient_status() -> None:
         return
     log.info(
         "Ambient replies %s in %d channel(s) (%s): gate %s at threshold %d, at most %d an "
-        "hour and no sooner than %ds apart, after a %ds debounce. Unaddressed messages in "
+        "hour and no sooner than %ds apart, after a %ds debounce%s. Unaddressed messages in "
         "those channels are sent to the model.",
         "ON" if AMBIENT_MODE == "reply" else "in observe mode (nothing is posted)",
         len(AMBIENT_CHANNELS),
@@ -487,6 +528,8 @@ def log_ambient_status() -> None:
         AMBIENT_MAX_PER_HOUR,
         AMBIENT_COOLDOWN_SECONDS,
         AMBIENT_DEBOUNCE_SECONDS,
+        ", ignoring anything carrying a link or a file it can't open"
+        if AMBIENT_STRICT_CONTENT else "",
     )
 
 
@@ -855,6 +898,62 @@ async def resolve_reference(message: discord.Message) -> discord.Message | None:
 
 def image_urls_in(message: discord.Message) -> list[str]:
     return [a.url for a in message.attachments if is_image(a)]
+
+
+def audio_format(attachment: discord.Attachment) -> str | None:
+    """The format name OpenRouter wants, or None if this isn't audio we can send."""
+    extension = attachment.filename.rsplit(".", 1)
+    if len(extension) == 2 and extension[1].lower() in AUDIO_FORMATS:
+        return AUDIO_FORMATS[extension[1].lower()]
+    kind = (attachment.content_type or "").split(";")[0].strip().lower()
+    if kind.startswith("audio/"):
+        return AUDIO_MIME_FORMATS.get(kind.removeprefix("audio/"))
+    return None
+
+
+def audio_in(message: discord.Message) -> list[tuple[str, str]]:
+    """(url, format) per clip. The bytes are fetched only if a reply is coming.
+    Oversized clips are left out here, so they count as a file it can't open."""
+    if not AUDIO_ENABLED:
+        return []
+    found = ((a, audio_format(a)) for a in message.attachments)
+    return [
+        (a.url, fmt) for a, fmt in found
+        if fmt and getattr(a, "size", 0) <= AUDIO_MAX_BYTES
+    ]
+
+
+async def fetch_audio(clips: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Download and base64 each clip, dropping any that is missing or too big."""
+    encoded = []
+    for url, fmt in clips[:MAX_AUDIO_CLIPS]:
+        try:
+            async with bot.session.get(url, timeout=AUDIO_TIMEOUT) as response:
+                if response.status != 200:
+                    log.info("Audio fetch returned HTTP %d", response.status)
+                    continue
+                declared = response.content_length
+                # read() returns only what is buffered, so a clip needs a loop.
+                # One byte past the cap distinguishes "at the limit" from "over".
+                buffer = bytearray()
+                async for chunk in response.content.iter_chunked(AUDIO_CHUNK_BYTES):
+                    buffer += chunk
+                    if len(buffer) > AUDIO_MAX_BYTES:
+                        break
+                data = bytes(buffer)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.info("Couldn't fetch an audio clip: %s", exc)
+            continue
+        if len(data) > AUDIO_MAX_BYTES:
+            log.info("Skipped a %s clip over the %d byte limit", fmt, AUDIO_MAX_BYTES)
+            continue
+        # A short read is silent corruption: the model hears static and says so.
+        if declared and len(data) < declared:
+            log.warning("Audio clip cut short: %d of %d bytes", len(data), declared)
+            continue
+        log.info("Sending a %s clip of %d bytes to the model", fmt, len(data))
+        encoded.append((base64.b64encode(data).decode("ascii"), fmt))
+    return encoded
 
 
 def strip_bot_mention(message: discord.Message) -> str:
@@ -1295,18 +1394,54 @@ def describe_chat_failure(exc: BaseException) -> str:
     return "Something went wrong answering that."
 
 
+async def describe_audio(clips: Sequence[tuple[str, str]]) -> str:
+    """One tool-free call whose only job is to hear the clip. Returns "" on any
+    failure - the answer is worth giving without it."""
+    try:
+        reply = await ask(
+            bot.session,
+            AUDIO_DESCRIBE_SYSTEM,
+            AUDIO_DESCRIBE_QUESTION,
+            api_key=OPENROUTER_API_KEY,
+            model=OPENROUTER_MEDIA_MODEL,
+            max_tokens=OPENROUTER_MAX_TOKENS,
+            max_price=OPENROUTER_MAX_PRICE,
+            max_context_tokens=MAX_CONTEXT_TOKENS,
+            audio=clips,
+        )
+    except Exception as exc:
+        log.info("Couldn't describe the audio: %s", describe_chat_failure(exc))
+        return ""
+    log.info("Described a clip in %d chars via %s, cost $%.6f",
+             len(reply.text), reply.model or "?", reply.cost)
+    return reply.text.strip()
+
+
 async def answer_mention(
     question: str,
     image_urls: list[str],
     history: list[dict] | None = None,
     who: str = "someone",
+    audio: Sequence[tuple[str, str]] = (),
 ) -> tuple[str, bool]:
     """Returns (reply text, worth remembering). Errors are returned, not raised,
     but never enter the conversation history."""
-    model = OPENROUTER_IMAGE_MODEL if image_urls else OPENROUTER_TEXT_MODEL
+    clips = await fetch_audio(audio)
+    model = OPENROUTER_MEDIA_MODEL if image_urls or clips else OPENROUTER_TEXT_MODEL
     tools = AgentTools(
         image_urls[0] if image_urls else None, who, bool(URL_PATTERN.search(question))
     )
+    # An image needs the tools and the clip can't be sent alongside them, so the
+    # clip is described first and travels as text instead.
+    if clips and image_urls:
+        # Flattened: this is model output built from someone's audio, and a
+        # newline in it would forge structure in the question it lands in.
+        heard = flatten(await describe_audio(clips), MAX_HEARD_CHARS)
+        if heard:
+            question += AUDIO_HEARD_TEMPLATE.format(heard=heard)
+        clips = ()
+    # A tool list makes some models deny the audio they were just billed for.
+    offered = () if clips else tools.definitions
 
     try:
         reply = await ask(
@@ -1320,9 +1455,10 @@ async def answer_mention(
             max_price=OPENROUTER_MAX_PRICE,
             max_context_tokens=MAX_CONTEXT_TOKENS,
             history=history or [],
-            tools=tools.definitions,
-            tool_runner=tools,
+            tools=offered,
+            tool_runner=tools if offered else None,
             max_tool_rounds=AGENT_TOOL_ROUNDS,
+            audio=clips,
         )
     except Exception as exc:
         return describe_chat_failure(exc), False
@@ -1370,13 +1506,16 @@ async def handle_mention(message: discord.Message) -> bool:
     question = strip_bot_mention(message)
     # "@bot what is this" as a reply means the image one message up, not this one.
     image_urls = image_urls_in(message)
+    audio = audio_in(message)
     if replied is not None:
         image_urls += [u for u in image_urls_in(replied) if u not in image_urls]
-    if not question and not image_urls:
+        audio += [c for c in audio_in(replied) if c not in audio]
+    # A voice note on its own is a question, even with nothing typed alongside.
+    if not question and not image_urls and not audio:
         await safe_reply(message, NO_QUESTION_REPLY)
         return True
     if not question:
-        question = DESCRIBE_IMAGE_QUESTION
+        question = DESCRIBE_IMAGE_QUESTION if image_urls else DESCRIBE_AUDIO_QUESTION
 
     # Channels are shared, so the history has to say who said what.
     speaker = message.author.display_name
@@ -1385,14 +1524,15 @@ async def handle_mention(message: discord.Message) -> bool:
 
     # Length, never the text: what people say to the bot stays out of the log.
     log.info(
-        "Mention from %s (%d chars, %d image(s), %d remembered)",
+        "Mention from %s (%d chars, %d image(s), %d clip(s), %d remembered)",
         who,
         len(question),
         len(image_urls),
+        len(audio),
         len(history),
     )
     async with message.channel.typing():
-        answer, keep = await answer_mention(remembered, image_urls, history, who)
+        answer, keep = await answer_mention(remembered, image_urls, history, who, audio)
 
     if keep:
         conversations.remember(message.channel.id, "user", remembered)
@@ -1404,6 +1544,7 @@ async def handle_mention(message: discord.Message) -> bool:
 def to_record(message: discord.Message) -> MessageRecord:
     """The discord boundary: nothing below this line knows what a Message is."""
     images = image_urls_in(message)
+    audio = audio_in(message)
     return MessageRecord(
         author=message.author.display_name,
         author_id=message.author.id,
@@ -1412,9 +1553,10 @@ def to_record(message: discord.Message) -> MessageRecord:
         image_urls=tuple(images),
         message_id=message.id,
         at=time.monotonic(),
-        # Video, audio and documents are noted so the model knows they exist and
-        # can say it can't open them, never fetched or described.
-        other_files=len(message.attachments) > len(images),
+        # Video and documents are noted so the model knows they exist and can
+        # say it can't open them, never fetched or described.
+        other_files=len(message.attachments) > len(images) + len(audio),
+        audio=tuple(audio),
     )
 
 
@@ -1443,6 +1585,9 @@ def ambient_eligible(message: discord.Message, record: MessageRecord) -> str | N
     # Other bots are transcript, never a trigger: two of these would loop.
     if message.author.bot:
         return "another bot"
+    # Strict mode ignores the whole message, not just the part it can't open.
+    if AMBIENT_STRICT_CONTENT and carries_unreadable(record):
+        return "it carries something I can't open"
     if not is_readable(record):
         return "nothing in it I can read"
     return None
@@ -1579,6 +1724,7 @@ async def compose_ambient(
     """The reply itself. No tools: with none offered there is nothing for the
     model to spend a round on, and the top-link reinstatement has nothing to fix."""
     images = images_for_reply(records, target)
+    clips = await fetch_audio(audio_for_reply(records, target))
     history = build_reply_history(records, bot.user.id if bot.user else 0)
     # Typing means "I've decided to speak", so it never shows while judging, and
     # never in observe mode, where nothing is going to appear.
@@ -1591,12 +1737,13 @@ async def compose_ambient(
                 f"{AGENT_CONTEXT}\n\n{AMBIENT_CONTEXT_NOTE}",
                 REPLY_INSTRUCTION,
                 api_key=OPENROUTER_API_KEY,
-                model=OPENROUTER_IMAGE_MODEL if images else OPENROUTER_TEXT_MODEL,
+                model=OPENROUTER_MEDIA_MODEL if images or clips else OPENROUTER_TEXT_MODEL,
                 max_tokens=OPENROUTER_MAX_TOKENS,
                 image_urls=images,
                 max_price=OPENROUTER_MAX_PRICE,
                 max_context_tokens=MAX_CONTEXT_TOKENS,
                 history=history,
+                audio=clips,
             )
     except Exception as exc:
         log.info("Ambient reply failed, staying quiet: %s", describe_chat_failure(exc))

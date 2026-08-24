@@ -26,9 +26,9 @@ BOT_ID = 4242
 
 
 def rec(author="alpha", author_id=1, text="hello", images=(), mid=100, at=0.0,
-        is_bot=False, other_files=False):
+        is_bot=False, other_files=False, audio=()):
     return A.MessageRecord(author, author_id, is_bot, text, tuple(images), mid, at,
-                           other_files)
+                           other_files, tuple(audio))
 
 
 # --- buffer ---
@@ -127,7 +127,8 @@ check("the prompt says being named is enough on its own",
       "is on its own enough" in prompt)
 check("the prompt refuses an image-only reading",
       "not only an image tool" in prompt)
-check("the prompt refuses files it can't open", "cannot open" in prompt)
+check("the prompt refuses files it can't open", "must not offer to open a file" in prompt)
+check("the prompt says audio is readable now", "listen to audio" in prompt)
 check("the self summary is substituted",
       "a test bot" in A.build_judge_prompt(convo, "a test bot"))
 check("a blank summary falls back", A.DEFAULT_SELF_SUMMARY in A.build_judge_prompt(convo, ""))
@@ -346,6 +347,9 @@ check("an unlisted channel is never buffered",
 check("an unlisted channel stays empty", B.ambient_buffer.size(OTHER) == 0)
 # Buffering is not gating: a message a mention handles is still transcript.
 check("another bot's message is buffered", B.observe_ambient(Msg(author_bot=True)) is not None)
+
+B.AMBIENT_STRICT_CONTENT = False
+
 
 def eligible(msg):
     """None from ambient_eligible means proceed, so eligibility is its absence."""
@@ -593,6 +597,59 @@ check("a targeted other bot is not addressed",
       A.addressee([rec("alpha", 1, "hi"), rec("elsebot", 8, "beep", is_bot=True)], 2, BOT) == 1)
 check("a channel of only bots has no addressee",
       A.addressee([rec("me", BOT, "mine", is_bot=True)], None, BOT) is None)
+
+# --- unanswerable messages never buy a gate call ---
+check("a bare link is not readable", not A.is_readable(rec(text="https://example.com/a")))
+check("two bare links are not readable",
+      not A.is_readable(rec(text="https://example.com/a https://example.com/b")))
+check("a suppressed link is not readable", not A.is_readable(rec(text="<https://example.com/a>")))
+check("a link with a question is readable",
+      A.is_readable(rec(text="what is this https://example.com/a")))
+check("a link with an image is readable",
+      A.is_readable(rec(text="https://example.com/a", images=("https://cdn/x.png",))))
+check("punctuation alone is not readable", not A.is_readable(rec(text="?!")))
+check("plain text is still readable", A.is_readable(rec(text="hello")))
+check("a lone video is still not readable", not A.is_readable(rec(text="", other_files=True)))
+
+# --- strict content ---
+check("a caption on a video carries something unopenable",
+      A.carries_unreadable(rec(text="look at this", other_files=True)))
+check("a link with a question carries something unopenable",
+      A.carries_unreadable(rec(text="what is this https://example.com/a")))
+check("plain text carries nothing unopenable", not A.carries_unreadable(rec(text="hello")))
+check("an image carries nothing unopenable",
+      not A.carries_unreadable(rec(text="what is this", images=("https://cdn/x.png",))))
+
+B.AMBIENT_STRICT_CONTENT = True
+check("strict mode refuses a captioned video",
+      B.ambient_eligible(Msg("look at this", attachments=[mov]),
+                         B.to_record(Msg("look at this", attachments=[mov])))
+      == "it carries something I can't open")
+check("strict mode refuses a captioned link",
+      B.ambient_eligible(Msg("what is this https://example.com/a"),
+                         B.to_record(Msg("what is this https://example.com/a")))
+      == "it carries something I can't open")
+check("strict mode still allows plain text",
+      B.ambient_eligible(Msg("hello"), B.to_record(Msg("hello"))) is None)
+B.AMBIENT_STRICT_CONTENT = False
+check("lenient mode allows a captioned link",
+      B.ambient_eligible(Msg("what is this https://example.com/a"),
+                         B.to_record(Msg("what is this https://example.com/a"))) is None)
+
+# --- audio ---
+voice = rec(text="", audio=(("https://cdn/v.ogg", "ogg"),))
+check("a voice note alone is readable", A.is_readable(voice))
+check("a voice note carries nothing unopenable", not A.carries_unreadable(voice))
+check("the transcript marks a voice note", A.AUDIO_MARK in A.said(voice))
+check("a captioned voice note keeps both", A.said(rec(text="listen", audio=(("u", "ogg"),)))
+      == f"listen {A.AUDIO_MARK}")
+check("the newest clip is chosen without a target",
+      A.audio_for_reply([rec(audio=(("a", "ogg"),)), rec(audio=(("b", "ogg"),))]) == [("b", "ogg")])
+check("the targeted clip wins",
+      A.audio_for_reply([rec(audio=(("a", "ogg"),)), rec(audio=(("b", "ogg"),))], 1) == [("a", "ogg")])
+check("no audio anywhere is an empty list", A.audio_for_reply([rec(text="hi")]) == [])
+check("only one clip is sent",
+      len(A.audio_for_reply([rec(audio=(("a", "ogg"), ("b", "ogg")))])) == A.MAX_REPLY_AUDIO)
 
 print(f"ambient: {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

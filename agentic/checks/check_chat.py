@@ -32,6 +32,28 @@ check("a one-entry chain is a plain model",
 check("model_field drops blanks", ca.model_field(["a/one", "", "b/two"])["models"] == ["a/one", "b/two"])
 check("an empty chain falls back rather than sending models: []",
       ca.model_field([]) == {"model": ca.FREE_ROUTER_MODEL})
+# Audio has no URL form, so it rides in the body as base64.
+_audio_body = ca.build_request("s", "q", "m/1", 50, audio=[("AAAA", "ogg")])
+_audio_parts = _audio_body["messages"][-1]["content"]
+check("audio becomes an input_audio part",
+      _audio_parts[-1] == {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "ogg"}})
+check("the question still leads the parts", _audio_parts[0]["type"] == "text")
+# Without the label the model reads any attachment as an image.
+check("the text part says the clip is audio", "not an image" in _audio_parts[0]["text"])
+check("no audio means no label",
+      ca.AUDIO_NOTE not in ca.build_request("s", "q", "m/1", 50)["messages"][-1]["content"])
+check("no audio and no image stays a plain string",
+      isinstance(ca.build_request("s", "q", "m/1", 50)["messages"][-1]["content"], str))
+check("audio is capped per message",
+      sum(1 for p in ca.build_request(
+          "s", "q", "m/1", 50,
+          audio=[("A", "ogg")] * (ca.MAX_AUDIO_CLIPS + 2))["messages"][-1]["content"]
+          if p["type"] == "input_audio") == ca.MAX_AUDIO_CLIPS)
+check("images and audio travel together",
+      [p["type"] for p in ca.build_request("s", "q", "m/1", 50, ["http://x/a.png"],
+                                           audio=[("A", "ogg")])["messages"][-1]["content"]]
+      == ["text", "image_url", "input_audio"])
+
 # OpenRouter 400s on a fourth entry, so the cap binds where the body is built.
 check("model_field caps the array at three",
       ca.model_field(["a/1", "b/2", "c/3", "d/4"]) == {"models": ["a/1", "b/2", "c/3"]})

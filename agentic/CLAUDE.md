@@ -143,6 +143,46 @@ behind it, not the runner itself.
   `other_files` for everything else; the transcript marks those so the model can say it
   can't open them, and a message with no text and no image never buys a gate call
   (`is_readable`). Video, audio and documents are never fetched.
+- **Audio goes to the model as base64 in the request body.** OpenRouter takes a URL for
+  images and refuses one for audio (`input_audio` parts, `data` + `format`), so `fetch_audio`
+  downloads the clip and inlines it — capped by `AUDIO_MAX_BYTES` and read one byte past the
+  cap so "at the limit" and "over it" are distinguishable. **The body has to be looped over**:
+  aiohttp's `read(n)` waits only until *some* data is buffered and then returns what is there,
+  so anything past the first chunk was silently dropped and the model was handed a truncated
+  clip — which it duly described as static and modem noise. `iter_chunked` plus a
+  `content_length` comparison; a short read is dropped rather than sent. Base64 inflates by a third. The
+  record stores `(url, format)` and the bytes are fetched only once a reply is committed to,
+  so a clip nobody answers costs nothing. `MAX_AUDIO_CLIPS` is 1: audio is billed by duration.
+  Formats come from the extension first, the content type second — Discord voice notes are
+  `.ogg`. Both media models accept audio; `openrouter/free` is not in that chain anyway.
+  A clip over the cap is dropped at `audio_in`, so it counts as an unopenable file rather
+  than as audio the bot will claim to have heard.
+- **A tool list makes some models deny audio they were just billed for.** Verified live
+  2026-08-24 on `google/gemini-2.5-flash-lite`: the same request with `tools` attached
+  answers "I can't listen to audio", and without them describes the clip — `audio_tokens`
+  is 25 either way, so it heard it and refused anyway. `google/gemini-2.5-flash` is fine.
+  Images never trip it, only audio. `answer_mention` therefore offers no tools when a clip
+  is the only attachment. **A message carrying both takes two calls**: `describe_audio` hears
+  the clip tool-free, its answer goes into the question as text, and the main call keeps the
+  image and the whole tool list. A failed description is dropped rather than raised — the
+  answer is worth giving without it.
+- **The text part has to say the attachment is audio** (`AUDIO_NOTE`). Without it the model
+  calls the clip "an image file" and reaches for `find_image_source`, since the persona is
+  image-shaped and nothing else in the request says otherwise.
+- **Audio counts as readable, video and documents still don't.** `other_files` now excludes
+  audio, `is_readable` treats a lone voice note as a question, and the judge prompt and
+  `AMBIENT_CONTEXT_NOTE` both say the bot can listen — **and so must `agent_context.md`**,
+  which is the mention path's system prompt and is gitignored, so a fresh checkout needs it
+  edited by hand. A persona still claiming it can't hear will refuse an attached clip in the
+  bot's own voice, with the plumbing working perfectly. Adding a modality means changing all
+  five.
+- **A bare link doesn't buy a gate call either.** `is_readable` strips URLs and asks whether
+  anything alphanumeric is left, so a pasted link alone is buffered as context but never
+  judged — the ambient reply is offered no tools, so it has nothing to open a page with.
+  This is coupled to that: give the ambient path `read_page` and the filter has to go.
+  `AMBIENT_STRICT_CONTENT` widens it to the whole message — a caption beside a video or a
+  link buys no gate call either, where the default judges the caption and skips the file.
+  `image_urls_in` reads attachments only, so a pasted image URL is not vision input today.
 - **The reply prompt says outright that nobody asked.** Without `AMBIENT_CONTEXT_NOTE` the
   model reads the transcript as a question put to it and answers like a summoned assistant
   — greeting the channel, summarising, offering more help. The persona alone doesn't fix it.
@@ -179,6 +219,13 @@ behind it, not the runner itself.
 - **Observe mode costs the same as running live.** It pays for the judge *and* the reply,
   and consumes the hourly slot, so the logged cadence matches what a live run would do.
   That's the point — you're reading what it would have said.
+- **`check_bot.py` mutates module globals as it goes**, so a check appended at the end runs
+  against whatever the last section left behind — `bot.user`, `answer_mention` and the
+  feature flags are all swapped mid-file. Put a check beside the section whose state it
+  needs, not at the bottom.
+- **Checks import `bot.py`, which calls `load_dotenv()`, so a developer's `.env` steers
+  them.** `AMBIENT_STRICT_CONTENT=true` in a real `.env` silently flipped four eligibility
+  checks. Pin any flag a check depends on rather than trusting the default.
 - **`bot.py` reads env at import time** (`os.environ[...]`). Importing it without
   `DISCORD_BOT_TOKEN` / `SERPAPI_KEY` set raises `KeyError`. Set dummies to import in tests.
 - **Logging goes through a `QueueListener`** so disk writes never block the event loop, and
@@ -208,7 +255,7 @@ behind it, not the runner itself.
   says which ids it dropped), **an invalid model id is a hard 400, not a skipped entry**,
   and `route: "fallback"` is neither needed nor helpful (it 429'd where the bare array
   succeeded).
-  **`OPENROUTER_IMAGE_MODEL` is the exception** (`free_last=False`): a router with no vision
+  **`OPENROUTER_MEDIA_MODEL` is the exception** (`free_last=False`): a router with no vision
   endpoint can only turn a busy paid model into `ChatNoEndpoints`, which reads to the user
   as "the admin misconfigured me". It is dropped from that chain even when inherited from
   `OPENROUTER_MODEL` — unless it is all that chain has, since nothing can serve an empty one.

@@ -213,13 +213,30 @@ class Conversation:
             del self._log[key]
 
 
-def _user_content(question: str, image_urls: Sequence[str]) -> str | list[dict]:
+# Without this the model reads an attachment as an image, whatever it actually is.
+AUDIO_NOTE = (
+    "\n\n(An audio clip is attached to this message. It is audio, not an image. "
+    "Listen to it and answer about what you hear.)"
+)
+
+# One clip a message: audio is billed by duration and inflates the body by a third.
+MAX_AUDIO_CLIPS = 1
+
+
+def _user_content(
+    question: str, image_urls: Sequence[str], audio: Sequence[tuple[str, str]] = ()
+) -> str | list[dict]:
     text = question[:MAX_QUESTION_CHARS]
-    if not image_urls:
+    if not image_urls and not audio:
         return text
-    return [{"type": "text", "text": text}] + [
-        {"type": "image_url", "image_url": {"url": url}} for url in image_urls[:MAX_IMAGES]
+    parts: list[dict] = [{"type": "text", "text": text + (AUDIO_NOTE if audio else "")}]
+    parts += [{"type": "image_url", "image_url": {"url": url}} for url in image_urls[:MAX_IMAGES]]
+    # OpenRouter takes no URL for audio, so the bytes travel in the body.
+    parts += [
+        {"type": "input_audio", "input_audio": {"data": data, "format": fmt}}
+        for data, fmt in audio[:MAX_AUDIO_CLIPS]
     ]
+    return parts
 
 
 # OpenRouter rejects a longer array outright, so the tail is dropped, not sent.
@@ -244,6 +261,7 @@ def build_request(
     max_price: float | None = None,
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
     history: Sequence[dict] = (),
+    audio: Sequence[tuple[str, str]] = (),
 ) -> dict:
     prompt = fit_to_budget(context, history, question, max_context_tokens)
     body = {
@@ -255,7 +273,7 @@ def build_request(
         "messages": [
             {"role": "system", "content": prompt.context},
             *prompt.history,
-            {"role": "user", "content": _user_content(prompt.question, image_urls)},
+            {"role": "user", "content": _user_content(prompt.question, image_urls, audio)},
         ],
     }
     # Omitted by default: too low a ceiling leaves no endpoints and 404s.
@@ -424,11 +442,12 @@ async def ask(
     tools: Sequence[dict] = (),
     tool_runner: ToolRunner | None = None,
     max_tool_rounds: int = MAX_TOOL_ROUNDS,
+    audio: Sequence[tuple[str, str]] = (),
 ) -> ChatReply:
     headers = build_headers(api_key)
     body = build_request(
         context, question, model, max_tokens, image_urls, max_price,
-        max_context_tokens, history,
+        max_context_tokens, history, audio,
     )
     if tools and tool_runner:
         body["tools"] = list(tools)

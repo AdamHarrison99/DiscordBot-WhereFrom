@@ -1,5 +1,5 @@
 """Offline checks for the bot.py mention wiring. Fakes discord objects."""
-import asyncio, os, sys, types
+import asyncio, base64, os, sys, types
 from pathlib import Path
 
 repo = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[2]
@@ -10,6 +10,7 @@ os.environ["LOG_FILE"] = "none"
 os.environ["OPENROUTER_API_KEY"] = "sk-test"
 
 import bot as B
+import chat_agent as CA
 
 ok, fail = 0, 0
 def check(label, cond):
@@ -28,6 +29,9 @@ class Msg:
     def __init__(self, content, author_id=1, author_bot=False, attachments=(),
                  mentions=None, mention_everyone=False, reference=None, channel_id=10):
         self.content = content
+        # to_record reads the rendered form, where mentions are already names.
+        self.clean_content = content
+        self.id = 500
         self.author = types.SimpleNamespace(id=author_id, bot=author_bot,
                                             display_name=f"user{author_id}")
         self.attachments = list(attachments)
@@ -72,10 +76,13 @@ check("bare mention -> empty", B.strip_bot_mention(Msg(MENTION)) == "")
 
 # --- handle_mention gating, without touching the network ---
 calls = []
+audio_calls = []
 answer_ok = True
-async def fake_answer(question, image_urls, history=None, who="someone"):
+async def fake_answer(question, image_urls, history=None, who="someone", audio=()):
     calls.append((question, list(image_urls), list(history or [])))
+    audio_calls.append(list(audio))
     return ("answer", answer_ok)
+real_answer_mention = B.answer_mention
 B.answer_mention = fake_answer
 
 class FakeTyping:
@@ -152,6 +159,95 @@ img = types.SimpleNamespace(url="https://cdn/x.png", filename="x.png", content_t
 asyncio.run(run(Msg(MENTION, attachments=[img])))
 check("image-only uses default question",
       calls == [(f"user1: {B.DESCRIBE_IMAGE_QUESTION}", ["https://cdn/x.png"], [])])
+
+# A voice note with nothing typed is a question, not an empty mention.
+calls.clear(); audio_calls.clear()
+fresh_throttle(); fresh_memory()
+voice = types.SimpleNamespace(url="https://cdn/v.ogg", filename="v.ogg",
+                              content_type="audio/ogg", size=1000)
+asyncio.run(run(Msg(MENTION, attachments=[voice])))
+check("a voice note alone reaches the model",
+      calls == [(f"user1: {B.DESCRIBE_AUDIO_QUESTION}", [], [])])
+check("the clip travels with it", audio_calls == [[("https://cdn/v.ogg", "ogg")]])
+
+# A tool list makes some models deny the audio, so audio-only goes without one.
+_asked = {}
+async def spy_ask(session, context, question, **kw):
+    _asked.update(kw)
+    return CA.ChatReply("ok", "m/1", 0.0)
+# answer_mention hands bot.session to ask; the spy ignores it, but it must exist.
+B.bot.session = None
+_real_ask, B.ask = B.ask, spy_ask
+_real_fetch, B.fetch_audio = B.fetch_audio, lambda clips: _fake_fetch(clips)
+async def _fake_fetch(clips): return [("BASE64", f) for _, f in clips]
+
+asyncio.run(real_answer_mention("q", [], None, "someone", [("https://cdn/v.ogg", "ogg")]))
+check("audio alone offers no tools", _asked["tools"] == ())
+check("audio alone passes no tool runner", _asked["tool_runner"] is None)
+check("the clip still goes", _asked["audio"] == [("BASE64", "ogg")])
+
+# Both at once: the clip is described first, then travels as text so the image
+# can still have its tools.
+_seen = []
+async def recording_ask(session, context, question, **kw):
+    _seen.append((context, question, kw))
+    _asked.update(kw)
+    return CA.ChatReply("a dog barking", "m/1", 0.0)
+B.ask = recording_ask
+_asked.clear()
+asyncio.run(real_answer_mention("q", ["https://cdn/x.png"], None, "someone",
+                                [("https://cdn/v.ogg", "ogg")]))
+check("both attachments cost two calls", len(_seen) == 2)
+check("the first call is the description", _seen[0][1] == B.AUDIO_DESCRIBE_QUESTION)
+check("the first call carries the clip", _seen[0][2]["audio"] == [("BASE64", "ogg")])
+check("the first call has no tools", not _seen[0][2].get("tools"))
+check("what was heard reaches the second call", "a dog barking" in _seen[1][1])
+check("the second call sends no audio", _seen[1][2]["audio"] == ())
+check("an image keeps the tools", _asked["tools"] != ())
+check("an image keeps the runner", _asked["tool_runner"] is not None)
+
+# A failed description must not cost the answer.
+_seen.clear()
+async def failing_ask(session, context, question, **kw):
+    if not _seen:
+        _seen.append("described")
+        raise CA.ChatUnavailable("upstream is down")
+    _seen.append((context, question, kw))
+    return CA.ChatReply("ok", "m/1", 0.0)
+B.ask = failing_ask
+answer, _ = asyncio.run(real_answer_mention("q", ["https://cdn/x.png"], None, "someone",
+                                            [("https://cdn/v.ogg", "ogg")]))
+check("a failed description still answers", answer == "ok")
+check("and adds no audio note", "contains:" not in _seen[1][1])
+
+# The description is model output made from someone's audio, so it can't forge
+# structure in the question it is folded into.
+_seen.clear()
+async def chatty_ask(session, context, question, **kw):
+    _seen.append((context, question, kw))
+    if len(_seen) == 1:
+        return CA.ChatReply("line one\nline two" + "x" * 900, "m/1", 0.0)
+    return CA.ChatReply("ok", "m/1", 0.0)
+B.ask = chatty_ask
+asyncio.run(real_answer_mention("q", ["https://cdn/x.png"], None, "someone",
+                                [("https://cdn/v.ogg", "ogg")]))
+_folded = _seen[1][1]
+check("a newline in the description is flattened", "line one\nline two" not in _folded)
+check("the description is capped", len(_folded) < 900)
+check("the description still arrives", "line one" in _folded)
+B.ask = recording_ask
+
+_asked.clear()
+asyncio.run(real_answer_mention("q", [], None, "someone"))
+check("no audio keeps the tools", _asked["tools"] != ())
+B.ask, B.fetch_audio = _real_ask, _real_fetch
+
+calls.clear(); audio_calls.clear()
+fresh_throttle(); fresh_memory()
+doc = types.SimpleNamespace(url="https://cdn/n.pdf", filename="n.pdf",
+                            content_type="application/pdf", size=1000)
+asyncio.run(run(Msg(MENTION, attachments=[doc])))
+check("a document alone is still an empty mention", calls == [])
 
 # non-image attachments are not sent
 calls.clear()
@@ -292,11 +388,11 @@ check("no link recorded when the search fails", B.SourceFinder("u", "t").top_lin
 # already present, so "unset" is exercised as blank - the same env_str branch.
 def reload_models(text="", image="", base="openrouter/auto"):
     os.environ["OPENROUTER_TEXT_MODEL"] = text
-    os.environ["OPENROUTER_IMAGE_MODEL"] = image
+    os.environ["OPENROUTER_MEDIA_MODEL"] = image
     os.environ["OPENROUTER_MODEL"] = base
     import importlib
     m = importlib.reload(B)
-    return m.OPENROUTER_TEXT_MODEL, m.OPENROUTER_IMAGE_MODEL
+    return m.OPENROUTER_TEXT_MODEL, m.OPENROUTER_MEDIA_MODEL
 
 FREE = B.FREE_ROUTER_MODEL
 check("blank text model falls back to auto", reload_models()[0] == ("openrouter/auto", FREE))
@@ -657,6 +753,76 @@ check("an invented tool name is logged",
 logged.clear()
 asyncio.run(B.AgentTools(None, "asker")(call("read_page", '{"url": "http://x\nINFO forged"}')))
 check("an argument can't forge a log line", not any("forged" in m for m in logged))
+
+# --- audio attachments ---
+class Att:
+    def __init__(self, filename, content_type=None, size=1000):
+        self.filename, self.content_type, self.url = filename, content_type, f"https://cdn/{filename}"
+        self.size = size
+
+check("an ogg voice note is audio", B.audio_format(Att("voice-message.ogg")) == "ogg")
+check("opus maps to ogg", B.audio_format(Att("clip.opus")) == "ogg")
+check("mp3 by extension", B.audio_format(Att("song.mp3")) == "mp3")
+check("audio/mpeg by content type", B.audio_format(Att("noext", "audio/mpeg")) == "mp3")
+check("a charset suffix doesn't confuse it",
+      B.audio_format(Att("noext", "audio/ogg; codecs=opus")) == "ogg")
+check("an image is not audio", B.audio_format(Att("cat.png", "image/png")) is None)
+check("an unknown audio type is refused", B.audio_format(Att("x.weird", "audio/weird")) is None)
+
+B.AUDIO_ENABLED = True
+check("audio_in returns url and format",
+      B.audio_in(Msg("", attachments=[Att("v.ogg")])) == [("https://cdn/v.ogg", "ogg")])
+B.AUDIO_ENABLED = False
+check("the flag turns audio off entirely", B.audio_in(Msg("", attachments=[Att("v.ogg")])) == [])
+B.AUDIO_ENABLED = True
+
+_voice = B.to_record(Msg("", attachments=[Att("v.ogg")]))
+check("to_record carries the clip", _voice.audio == (("https://cdn/v.ogg", "ogg"),))
+check("audio is no longer an unopenable file", not _voice.other_files)
+_mixed = B.to_record(Msg("", attachments=[Att("v.ogg"), Att("doc.pdf", "application/pdf")]))
+check("a document alongside audio still counts", _mixed.other_files)
+
+# Too big to send is not audio it can hear - it is a file it can't open.
+_big = B.to_record(Msg("", attachments=[Att("v.ogg", size=B.AUDIO_MAX_BYTES + 1)]))
+check("an oversized clip is not carried", _big.audio == ())
+check("an oversized clip counts as unopenable", _big.other_files)
+check("a clip exactly at the cap is carried",
+      B.audio_in(Msg("", attachments=[Att("v.ogg", size=B.AUDIO_MAX_BYTES)])) != [])
+
+# A voice note is not an image, so it must not inherit the image question.
+check("audio-only asks about audio", B.DESCRIBE_AUDIO_QUESTION != B.DESCRIBE_IMAGE_QUESTION)
+check("the audio question mentions audio", "audio" in B.DESCRIBE_AUDIO_QUESTION.lower())
+
+
+# aiohttp's read(n) hands back only what is buffered, so the body has to be
+# looped over - a short read is a truncated clip and the model hears static.
+class Body:
+    def __init__(self, chunks): self.chunks = chunks
+    async def iter_chunked(self, n):
+        for chunk in self.chunks: yield chunk
+
+class Resp:
+    def __init__(self, chunks, declared=None):
+        self.status, self.content = 200, Body(chunks)
+        self.content_length = sum(len(c) for c in chunks) if declared is None else declared
+    async def __aenter__(self): return self
+    async def __aexit__(self, *exc): return False
+
+class AudioSession:
+    def __init__(self, resp): self.resp = resp
+    def get(self, url, timeout=None): return self.resp
+
+def fetched(resp):
+    B.bot.session = AudioSession(resp)
+    return asyncio.run(B.fetch_audio([("https://cdn/v.ogg", "ogg")]))
+
+check("every chunk of the clip is sent",
+      fetched(Resp([b"aa", b"bb", b"cc"])) == [(base64.b64encode(b"aabbcc").decode(), "ogg")])
+check("a clip cut short is dropped rather than sent as noise",
+      fetched(Resp([b"aa"], declared=6)) == [])
+check("a clip over the cap is still dropped",
+      fetched(Resp([b"x" * (B.AUDIO_MAX_BYTES + 1)])) == [])
+
 
 print(f"bot wiring: {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
