@@ -89,15 +89,14 @@ from ambient import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DEBOUNCE_SECONDS,
     DEFAULT_GATE_MODEL,
-    DEFAULT_MAX_PER_HOUR,
     DEFAULT_MAX_WAIT_SECONDS,
-    DEFAULT_SELF_SUMMARY,
     DEFAULT_STALE_MESSAGES,
     DEFAULT_THRESHOLD,
     AMBIENT_CONTEXT_NOTE,
     REPLY_INSTRUCTION,
     AmbientLimits,
     ChannelBuffer,
+    JudgePrompts,
     MessageRecord,
     addressee,
     audio_for_reply,
@@ -108,6 +107,7 @@ from ambient import (
     images_for_reply,
     is_readable,
     judge,
+    load_judge_prompts,
     resolve_mode,
 )
 
@@ -375,6 +375,8 @@ OPENROUTER_MAX_PRICE = (
 )
 MENTION_RATE_LIMIT = env_int("MENTION_RATE_LIMIT_PER_MINUTE", 4)
 AGENT_CONTEXT_FILE = env_str("AGENT_CONTEXT_FILE", "agent_context.md")
+JUDGE_TEMPLATE_FILE = env_str("JUDGE_TEMPLATE_FILE", "judge_template.md")
+JUDGE_EXAMPLE_FILE = "judge_template.example.md"
 MAX_CONTEXT_TOKENS = env_int("MAX_CONTEXT_TOKENS", DEFAULT_MAX_CONTEXT_TOKENS)
 # 0 turns makes every message standalone again.
 CONVERSATION_MEMORY_TURNS = env_int("CONVERSATION_MEMORY_TURNS", DEFAULT_MEMORY_TURNS, minimum=0)
@@ -404,11 +406,9 @@ AMBIENT_THRESHOLD = env_int("AMBIENT_THRESHOLD", DEFAULT_THRESHOLD, minimum=0)
 AMBIENT_DEBOUNCE_SECONDS = env_int("AMBIENT_DEBOUNCE_SECONDS", DEFAULT_DEBOUNCE_SECONDS, minimum=0)
 AMBIENT_MAX_WAIT_SECONDS = env_int("AMBIENT_MAX_WAIT_SECONDS", DEFAULT_MAX_WAIT_SECONDS)
 AMBIENT_COOLDOWN_SECONDS = env_int("AMBIENT_COOLDOWN_SECONDS", DEFAULT_COOLDOWN_SECONDS, minimum=0)
-AMBIENT_MAX_PER_HOUR = env_int("AMBIENT_MAX_PER_HOUR", DEFAULT_MAX_PER_HOUR, minimum=0)
 AMBIENT_BUFFER_MESSAGES = env_int("AMBIENT_BUFFER_MESSAGES", DEFAULT_BUFFER_MESSAGES)
 AMBIENT_STALE_MESSAGES = env_int("AMBIENT_STALE_MESSAGES", DEFAULT_STALE_MESSAGES, minimum=0)
 AMBIENT_STRICT_CONTENT = env_flag("AMBIENT_STRICT_CONTENT", False)
-AMBIENT_SELF_SUMMARY = env_str("AMBIENT_SELF_SUMMARY", DEFAULT_SELF_SUMMARY)
 
 AUDIO_ENABLED = env_flag("AUDIO_ENABLED", True)
 # Base64 inflates by a third, and the whole clip rides in the request body.
@@ -497,6 +497,26 @@ def resolve_agent_context() -> str | None:
     return context
 
 
+def resolve_judge_prompts() -> JudgePrompts | None:
+    """The gate's own wording. judge_template.md is gitignored, so a fresh clone
+    falls back to the committed example rather than losing the feature."""
+    path = Path(JUDGE_TEMPLATE_FILE)
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    for candidate in (path, BASE_DIR / JUDGE_EXAMPLE_FILE):
+        if not candidate.exists():
+            continue
+        try:
+            prompts = load_judge_prompts(candidate)
+        except ValueError as exc:
+            log.error("Ignoring %s: %s", candidate.name, exc)
+            continue
+        log.info("Ambient gate prompt read from %s", candidate.name)
+        return prompts
+    log.error("No usable gate prompt file, so nothing can be scored")
+    return None
+
+
 def log_ambient_status() -> None:
     """Said out loud at startup because it widens what leaves the machine."""
     if not AMBIENT_ENABLED:
@@ -505,16 +525,18 @@ def log_ambient_status() -> None:
     if not AMBIENT_CHANNELS:
         log.warning("AMBIENT_ENABLED is set but AMBIENT_CHANNELS is empty, so nothing is read")
         return
+    if JUDGE_PROMPTS is None:
+        log.warning("Ambient replies are on but the gate has no prompt, so none will be sent")
+        return
     log.info(
-        "Ambient replies %s in %d channel(s) (%s): gate %s at threshold %d, at most %d an "
-        "hour and no sooner than %ds apart, after a %ds debounce%s. Unaddressed messages in "
+        "Ambient replies %s in %d channel(s) (%s): gate %s at threshold %d, no sooner than "
+        "%ds apart, after a %ds debounce%s. Unaddressed messages in "
         "those channels are sent to the model.",
         "ON" if AMBIENT_MODE == "reply" else "in observe mode (nothing is posted)",
         len(AMBIENT_CHANNELS),
         ", ".join(str(c) for c in sorted(AMBIENT_CHANNELS)),
         " then ".join(AMBIENT_GATE_MODEL),
         AMBIENT_THRESHOLD,
-        AMBIENT_MAX_PER_HOUR,
         AMBIENT_COOLDOWN_SECONDS,
         AMBIENT_DEBOUNCE_SECONDS,
         ", ignoring anything carrying a link or a file it can't open"
@@ -542,6 +564,7 @@ class DailyBudget:
         return True
 
 
+JUDGE_PROMPTS = resolve_judge_prompts() if AMBIENT_ENABLED else None
 AGENT_CONTEXT = resolve_agent_context()
 mention_throttle = MentionThrottle(MENTION_RATE_LIMIT)
 conversations = Conversation(
@@ -549,9 +572,7 @@ conversations = Conversation(
 )
 web_budget = DailyBudget(WEB_SEARCH_DAILY_LIMIT)
 ambient_buffer = ChannelBuffer(AMBIENT_BUFFER_MESSAGES, CONVERSATION_MEMORY_MINUTES * 60)
-ambient_limits = AmbientLimits(
-    AMBIENT_CHANNELS, AMBIENT_COOLDOWN_SECONDS, AMBIENT_MAX_PER_HOUR
-)
+ambient_limits = AmbientLimits(AMBIENT_CHANNELS, AMBIENT_COOLDOWN_SECONDS)
 # One pending evaluation per channel: two overlapping bursts would double-post.
 ambient_tasks: dict[int, asyncio.Task] = {}
 ambient_burst_started: dict[int, float] = {}
@@ -1624,6 +1645,9 @@ async def run_ambient(channel: discord.abc.Messageable) -> None:
         log.info("Ambient: quiet in %s - %s", channel_id, refusal)
         return
 
+    if JUDGE_PROMPTS is None:
+        return
+
     started = time.monotonic()
     seen_id = ambient_buffer.newest_id(channel_id)
 
@@ -1632,8 +1656,9 @@ async def run_ambient(channel: discord.abc.Messageable) -> None:
             bot.session,
             records,
             api_key=OPENROUTER_API_KEY,
+            prompts=JUDGE_PROMPTS,
             model=AMBIENT_GATE_MODEL,
-            self_summary=AMBIENT_SELF_SUMMARY,
+            bot_id=bot.user.id if bot.user else None,
             max_price=OPENROUTER_MAX_PRICE,
         )
     except Exception as exc:

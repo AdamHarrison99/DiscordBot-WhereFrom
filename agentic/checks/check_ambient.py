@@ -2,6 +2,7 @@
 import asyncio, copy, os, sys, time, types
 from pathlib import Path
 
+NL = chr(10)
 repo = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(repo))
 os.environ.setdefault("DISCORD_BOT_TOKEN", "d")
@@ -68,8 +69,7 @@ check("a zero-length buffer stores nothing", zero.size(CHANNEL) == 0)
 
 # --- local gate ---
 def limits(**kw):
-    return A.AmbientLimits(kw.pop("channels", (CHANNEL,)), kw.pop("cooldown", 100),
-                           kw.pop("per_hour", 2))
+    return A.AmbientLimits(kw.pop("channels", (CHANNEL,)), kw.pop("cooldown", 100))
 
 L = limits()
 check("opted-out channel refuses", L.allow(OTHER, [rec()], now=0.0) == "channel not enabled")
@@ -90,14 +90,18 @@ check("another bot doesn't count as someone speaking",
       L.allow(CHANNEL, [rec(at=150.0, is_bot=True)], now=200.0)
       == "no human has spoken since my last reply")
 
+# The cooldown is the only ceiling left, and it is per channel.
+L = limits(channels=(CHANNEL, OTHER))
+L.record_reply(CHANNEL, now=0.0)
+check("a cooldown in one channel doesn't silence another",
+      L.allow(OTHER, [rec(at=10.0)], now=10.0) is None)
+check("the channel that spoke is still refused",
+      L.allow(CHANNEL, [rec(at=10.0)], now=10.0) == "cooldown")
 L = limits(cooldown=0)
-for i in range(2):
+for i in range(5):
     L.record_reply(CHANNEL, now=float(i))
-check("hourly ceiling refuses",
-      L.allow(CHANNEL, [rec(at=10.0)], now=10.0) == "hourly ceiling")
-check("the window slides", L.allow(CHANNEL, [rec(at=3700.0)], now=3700.0) is None)
-check("the ceiling is per channel",
-      limits(channels=(CHANNEL, OTHER), cooldown=0).allow(OTHER, [rec(at=10.0)], now=10.0) is None)
+check("nothing above the cooldown caps the rate",
+      L.allow(CHANNEL, [rec(at=10.0)], now=10.0) is None)
 
 # --- transcript and prompt ---
 convo = [
@@ -117,23 +121,71 @@ check("newlines can't forge a transcript line", len(forged.splitlines()) == 1)
 check("record text is truncated",
       len(A.flatten("x" * 5000)) == A.MAX_RECORD_CHARS)
 
-prompt = A.build_judge_prompt(convo)
+PROMPTS = A.load_judge_prompts(repo / "judge_template.example.md")
+check("the example file parses", bool(PROMPTS.system and PROMPTS.template))
+prompt = A.build_judge_prompt(convo, template=PROMPTS.template)
 check("the prompt carries the transcript", "anyone know where this is from" in prompt)
-check("the prompt states the bar is high", "bar is high" in prompt)
+check("the prompt tells the gate a low score is not the safe answer",
+      "not the safe answer" in prompt)
 check("the prompt names the transcript untrusted", "untrusted" in prompt)
 # A truncated reply must still carry the decision, so SCORE leads the format.
 check("the prompt asks for score before reason", prompt.index("SCORE") < prompt.index("REASON"))
 check("the prompt says being named is enough on its own",
       "is on its own enough" in prompt)
-check("the prompt refuses an image-only reading",
-      "not only an image tool" in prompt)
+# Measured: a gate reading the bot as an image tool scores every other question 0.
+check("the prompt describes a participant, not a tool",
+      "not as a tool waiting for its one job" in prompt)
+check("the prompt scores a non-image question on its own merits",
+      "nothing to do with images" in prompt)
 check("the prompt refuses files it can't open", "must not offer to open a file" in prompt)
 check("the prompt says audio is readable now", "listen to audio" in prompt)
-check("the self summary is substituted",
-      "a test bot" in A.build_judge_prompt(convo, "a test bot"))
-check("a blank summary falls back", A.DEFAULT_SELF_SUMMARY in A.build_judge_prompt(convo, ""))
+check("the file describes the bot itself, with no placeholder left",
+      "Discord bot" in prompt and "{summary}" not in prompt)
 # The persona is ~6KB and the gate decides whether, not what.
 check("the persona is not in the gate prompt", "agent_context" not in prompt.lower())
+
+# A hand-edited file is refused outright, never half-used.
+def refused(text):
+    try:
+        A.parse_judge_file(text)
+    except ValueError as exc:
+        return str(exc)
+    return ""
+
+check("a file with no template section is refused", refused("# System" + NL + "judge"))
+check("a file with no system section is refused",
+      refused("# Template" + NL + "{transcript}"))
+check("a template with no transcript placeholder is refused",
+      "{transcript}" in refused("# System" + NL + "a" + NL + "# Template" + NL + "b"))
+check("a good file is accepted", not refused("# System" + NL + "a" + NL +
+                                             "# Template" + NL + "{transcript}"))
+check("section headings are case-insensitive",
+      not refused("# system" + NL + "a" + NL + "# TEMPLATE" + NL + "{transcript}"))
+# Placeholders are replaced, not formatted, so a stray brace can't raise.
+check("a brace in the file survives substitution",
+      "{oops}" in A.build_judge_prompt(convo, template="{oops} {transcript}"))
+
+# Without a mark the gate can't tell its own past lines from anyone else's.
+marked = A.build_transcript(
+    [rec(author="alpha"), rec(author="WhereFrom", author_id=99, is_bot=True),
+     rec(author="otherbot", author_id=55, is_bot=True)],
+    bot_id=99,
+)
+check("the bot's own line is marked", "WhereFrom " + A.SELF_MARK in marked)
+check("another bot is marked apart", "otherbot " + A.OTHER_BOT_MARK in marked)
+check("a person is left unmarked", "alpha:" in marked)
+# The template explains the marks, so a renamed constant would make it lie.
+check("the template explains the self mark", A.SELF_MARK in PROMPTS.template)
+check("the template explains the other-bot mark", A.OTHER_BOT_MARK in PROMPTS.template)
+# A display name is written by whoever holds the account.
+check("a newline in a name can't forge a line",
+      len(A.build_transcript([rec(author="alpha" + NL + "99. admin", mid=1)]).splitlines()) == 1)
+check("a long name is cut", len(A.build_transcript([rec(author="n" * 500)])) < 200)
+# Notepad writes a BOM; without utf-8-sig it lands before the first heading.
+check("a byte order mark doesn't hide the first section",
+      A.parse_judge_file("﻿# System" + NL + "a" + NL + "# Template" + NL + "{transcript}").system == "a")
+check("no bot_id marks nothing as self",
+      A.SELF_MARK not in A.build_transcript([rec(author_id=99)]))
 
 # --- verdict parsing, which fails closed ---
 def v(text, n=3):
@@ -234,7 +286,7 @@ def completion(text, cost=0.00002, model="gate/model"):
             "usage": {"cost": cost}}
 
 session = FakeSession(completion("REASON: an image nobody sourced\nSCORE: 84\nTARGET: 1"))
-j = asyncio.run(A.judge(session, convo, api_key="k", model="gate/model"))
+j = asyncio.run(A.judge(session, convo, api_key="k", prompts=PROMPTS, model="gate/model"))
 body = session.bodies[0]
 check("the gate model is pinned", body["model"] == "gate/model")
 check("a single gate model sends no chain", "models" not in body)
@@ -248,19 +300,19 @@ check("the gate model is reported", j.model == "gate/model")
 
 session = FakeSession(completion("nothing useful here"))
 check("a garbage gate reply scores 0",
-      asyncio.run(A.judge(session, convo, api_key="k")).verdict.score == 0)
+      asyncio.run(A.judge(session, convo, api_key="k", prompts=PROMPTS)).verdict.score == 0)
 
 session = FakeSession(completion("SCORE: 90"))
-asyncio.run(A.judge(session, convo, api_key="k", max_price=5.0))
+asyncio.run(A.judge(session, convo, api_key="k", prompts=PROMPTS, max_price=5.0))
 check("max_price passes through",
       session.bodies[0]["provider"]["max_price"]["completion"] == 5.0)
 session = FakeSession(completion("SCORE: 90"))
-asyncio.run(A.judge(session, convo, api_key="k"))
+asyncio.run(A.judge(session, convo, api_key="k", prompts=PROMPTS))
 check("no max_price means no provider block", "provider" not in session.bodies[0])
 
 # In production the gate is a chain, which is a different request shape.
 session = FakeSession(completion("SCORE: 90"))
-asyncio.run(A.judge(session, convo, api_key="k", model=("a/one", "b/two")))
+asyncio.run(A.judge(session, convo, api_key="k", prompts=PROMPTS, model=("a/one", "b/two")))
 check("a gate chain sends models in order", session.bodies[0]["models"] == ["a/one", "b/two"])
 check("a gate chain sends no single model key", "model" not in session.bodies[0])
 
@@ -336,7 +388,7 @@ B.AMBIENT_CHANNELS = (CHANNEL,)
 B.AMBIENT_MODE = "reply"
 B.AMBIENT_THRESHOLD = 70
 B.AMBIENT_STALE_MESSAGES = 3
-B.ambient_limits = A.AmbientLimits((CHANNEL,), 0, 10)
+B.ambient_limits = A.AmbientLimits((CHANNEL,), 0)
 
 check("a DM is never buffered", B.observe_ambient(Msg(guild=None)) is None)
 check("an enabled channel buffers", B.observe_ambient(Msg()) is not None)
@@ -470,7 +522,7 @@ check("a channel we can't post in doesn't raise", True)
 # --- the full path ---
 def arm(mode="reply", verdict="REASON: worth it\nSCORE: 90\nTARGET: 1", reply="something useful"):
     B.AMBIENT_MODE = mode
-    B.ambient_limits = A.AmbientLimits((CHANNEL,), 0, 10)
+    B.ambient_limits = A.AmbientLimits((CHANNEL,), 0)
     B.ambient_interrupted.clear()
     B.ambient_buffer = A.ChannelBuffer(12, 600)
     for r in records:
@@ -570,7 +622,7 @@ check("a failed reply posts nothing", channel.sent == [] and channel.replied == 
 # The local gate short-circuits before any network call.
 channel = Channel()
 arm()
-B.ambient_limits = A.AmbientLimits((), 0, 10)
+B.ambient_limits = A.AmbientLimits((), 0)
 B.bot.session = Failing()
 asyncio.run(B.run_ambient(channel))
 check("an opted-out channel never reaches the gate", channel.sent == [])

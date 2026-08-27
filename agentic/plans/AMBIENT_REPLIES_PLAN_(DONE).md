@@ -245,12 +245,18 @@ All the free refusals in one place, so a reason string can be logged for each:
 
 - channel not in `AMBIENT_CHANNELS`
 - cooldown not elapsed since the last ambient reply here
-- hourly ceiling hit (`AMBIENT_MAX_PER_HOUR`, sliding window like `MentionThrottle`)
 - no human message since the bot's last ambient reply
 
 `allow(channel_id) -> str | None` — `None` to proceed, else the reason, which goes straight
 to the log. Every refusal being nameable is what makes the observe-mode log readable; it's
 the same reasoning that put every tool guard through `AgentTools._refuse`.
+
+> Later change: `AMBIENT_MAX_PER_HOUR` is gone. The cooldown already bounds how often a
+> channel hears from the bot, and a second ceiling only produced a refusal the cooldown
+> would have produced anyway.
+
+> Later change: `AMBIENT_SELF_SUMMARY` is gone. The description it held is written
+> straight into `judge_template.md`, which is the gate's whole prompt.
 
 ### `build_judge_prompt(records, self_summary) -> str`
 
@@ -340,7 +346,6 @@ Added to `.env.example` with a prose block in the existing style.
 | `AMBIENT_DEBOUNCE_SECONDS` | `5` | Quiet gap before a burst is judged |
 | `AMBIENT_MAX_WAIT_SECONDS` | `30` | Fire anyway, so a busy channel isn't starved |
 | `AMBIENT_COOLDOWN_SECONDS` | `120` | Minimum gap between ambient replies in one channel |
-| `AMBIENT_MAX_PER_HOUR` | `4` | Hard ceiling per channel; no score overrides it |
 | `AMBIENT_BUFFER_MESSAGES` | `12` | Transcript length handed to the judge |
 | `AMBIENT_STALE_MESSAGES` | `3` | New messages during generation that abort the post |
 | `AMBIENT_SELF_SUMMARY` | *(constant)* | One line telling the judge what the bot is |
@@ -358,9 +363,9 @@ worth being honest about:
   searches. If tools are ever enabled here, they go through the existing `AgentTools`
   rationing rather than a second one.
 - `MENTION_RATE_LIMIT_PER_MINUTE` is keyed by user id, and an ambient reply has no invoking
-  user. Ambient is bounded by `AMBIENT_COOLDOWN_SECONDS` and `AMBIENT_MAX_PER_HOUR`
-  instead — those are ceilings on *how often the bot speaks*, which is the thing that
-  actually needs limiting, and they are per channel rather than per user.
+  user. Ambient is bounded by `AMBIENT_COOLDOWN_SECONDS` instead — a ceiling on *how
+  often the bot speaks*, which is the thing that actually needs limiting, and it is per
+  channel rather than per user.
 - **OpenRouter dollars are the one genuinely shared pool, and nothing caps them today** —
   not for mentions either. Ambient adds a second uncapped spender to it. The per-hour
   ceiling bounds the reply spend; the judge spend is bounded only by traffic. On one
@@ -519,7 +524,7 @@ Kept so they aren't re-derived:
   API call. The same reasoning kept BeautifulSoup out of `page_reader.py`.
 - **Fixed-cadence polling** of every active channel every N seconds. Bounded, predictable
   cost. Strictly worse than debounce: it fires on silence, misses bursts, and debounce is
-  bounded anyway once the cooldown and hourly ceiling exist.
+  bounded anyway once the cooldown exists.
 - **Keyword triggering alone** — see "Why a name match isn't the trigger" above.
 
 ## Known limitations
@@ -565,7 +570,7 @@ Recorded because the rest of this document describes the design, not the diff.
   routed model, so `bot.py` can log the spend where the logger lives.
 - **Staleness is counted by message id** (`count_newer`), not by buffer length: the deque
   stops growing once full, so length would silently stop detecting drift.
-- **Observe mode consumes the hourly slot.** Otherwise the cadence in the log is not the
+- **Observe mode starts the cooldown.** Otherwise the cadence in the log is not the
   cadence a live run would have had, which defeats the purpose of calibrating on it.
 - **The reply transcript goes in `history`, not in the question.** `MAX_QUESTION_CHARS` is
   1000, which a twelve-message transcript would overrun.

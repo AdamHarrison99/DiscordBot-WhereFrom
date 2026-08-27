@@ -35,6 +35,7 @@ than duplicating it here. This file is what the README can't tell you.
 | `page_reader.py` | Fetches a URL and extracts text. Stdlib HTML parsing, no new deps |
 | `chat_agent.py` | OpenRouter chat for @-mentions, the per-user throttle, and `ask_once` |
 | `ambient.py` | Deciding whether to speak unprompted: buffer, local gate, judge. No discord imports |
+| `judge_template.md` | The gate's system prompt and scoring criteria. Gitignored; `.example.md` is committed |
 | `startup.bat` / `startup.sh` | Run the bot, creating the venv on first run |
 
 Both *image* search modules return the same normalised match dict — `title`, `link`,
@@ -197,11 +198,53 @@ behind it, not the runner itself.
   `AmbientLimits` reasons are all INFO. Only "not an enabled channel" stays DEBUG — it
   fires on every message in every channel of every guild. The startup line names the
   enabled channel ids for the same reason: a count can't be checked against a config.
-- **The judge scores against `AMBIENT_SELF_SUMMARY`, not `agent_context.md`.** The gate
-  deliberately never sees the persona, so that one sentence is the whole self-description
-  it reasons from — and a narrow one costs replies. A summary naming only image lookups had
-  the gate scoring a message about the bot at 0, giving "no valid image question" as its
-  reason. It is the highest-leverage calibration knob there is, ahead of the threshold.
+- **The gate's wording is a file, not code.** `judge_template.md` holds a `# System` and
+  a `# Template` section; `parse_judge_file` rejects anything missing either, or a template
+  with no `{transcript}`. Placeholders are **replaced, not `str.format`ed** — a hand-edited
+  file may hold braces, and a stray one would otherwise raise. It is gitignored like
+  `agent_context.md`, and `judge_template.example.md` is both the committed template and the
+  fallback a fresh clone actually runs on, so an edit to the example changes behaviour for
+  anyone who never made their own. Read at startup only, as `utf-8-sig` and stripped
+  again in the parser — Notepad writes a BOM, and it would sit in front of the first
+  heading and hide it, which reads as "no # system section".
+- **The transcript marks who is a bot.** Without it a criterion like "the bot spoke
+  recently" is unjudgeable: the gate sees display names and is told only `{summary}`, never
+  the bot's name, so its own lines read as another person's. `speaker` tags them
+  `(this bot)` and other bots `(a bot)`. The display name is flattened and capped like
+  the message text is — it is written by whoever holds the account, so it can carry a
+  newline or an impersonation of the marker. Records are buffered before the eligibility check,
+  which is why the bot's own messages are in there at all.
+- **The gate never sees `agent_context.md`.** It reasons entirely from
+  `judge_template.md`, which therefore has to describe the bot as well as score it — that
+  description is the highest-leverage knob there is, ahead of the threshold. A template
+  naming only image lookups had the gate scoring a message about the bot at 0, reasoning
+  that no image question had been asked. There is deliberately no second setting holding
+  the description: one file, one prompt.
+- **A wording change moved the gate further than a model change did.** Measured 2026-08-26
+  with `agentic/tools/probe_gate.py`, eight transcripts, three trials: an opening sentence
+  leading with image lookup had `google/gemini-2.5-flash-lite` scoring every non-image
+  question 0 — a flat "not image-related" whatever else was in the file. Describing a
+  channel member who *also* does image lookup, and saying outright that an unanswered
+  question scores 60 with no image in sight, took `mistralai/mistral-nemo` from overlapping
+  bands (a real question at 35, idle chatter at 40) to a clean +20 gap. Same model, same
+  threshold. Reach for the description before reaching for a bigger model.
+- **"Silence is the right answer far more often than not" is not free calibration.** It
+  reads as licence to score 0 rather than to score honestly, and a gate that only ever
+  answers 0 or 80 leaves the threshold nothing to do. The replacement says a low score is
+  a different answer rather than a safe one, and points at the bands.
+- **The gate is judged on separation, not on any single score.** What matters is whether
+  every "should speak" transcript lands above every "should stay quiet" one; a model can
+  use the whole range and still be useless if the two groups interleave. `probe_gate.py`
+  drives the real `run_ambient` with the threshold pushed out of reach, so it scores
+  without paying for replies, and reads the score back off the log line.
+- **Some cheap models can't be gates at all.** `openai/gpt-oss-120b` and
+  `z-ai/glm-5.3-flash` both reject `reasoning: {"enabled": false}` with a hard 400, the
+  same way `google/gemini-3.7-flash` does. Probe before adopting.
+- **Jokes are the criterion a cheap gate handles worst.** "Don't interrupt a working
+  exchange" and "reply when the conversation sets up a joke" describe the same transcript,
+  and flash-lite resolves the conflict toward silence on two runs in three even with an
+  explicit carve-out. Nemo scored the same setups 65-70. A gate that is otherwise weaker
+  can be the better one here.
 - **The verdict format puts `SCORE` first.** `GATE_MAX_TOKENS` is 40, so a model that
   overruns on `REASON` loses whatever comes after it. Score first means a truncated reply
   costs the explanation; reason first means it costs the decision, and `parse_verdict`
@@ -223,7 +266,7 @@ behind it, not the runner itself.
   leave `AMBIENT_STALE_MESSAGES` deciding nothing. A mention interrupts by timestamp
   (`ambient_interrupted`), read just before posting, for the same reason.
 - **Observe mode costs the same as running live.** It pays for the judge *and* the reply,
-  and consumes the hourly slot, so the logged cadence matches what a live run would do.
+  and starts the cooldown, so the logged cadence matches what a live run would do.
   That's the point — you're reading what it would have said.
 - **`check_bot.py` mutates module globals as it goes**, so a check appended at the end runs
   against whatever the last section left behind — `bot.user`, `answer_mention` and the
@@ -368,17 +411,20 @@ is unit-tested offline. The SauceNAO fallback landed after that and has **not** 
 verified live.
 
 **@-mention chat is built and works live** (`chat_agent.py`, `plans/MENTION_AGENT_PLAN.md`).
-563 offline checks (132 `chat_agent`, 173 `bot.py` wiring against faked messages, 36
-`web_search`, 68 `page_reader`, 154 `ambient`), plus both paths verified end-to-end
+675 offline checks (142 `chat_agent`, 219 `bot.py` wiring against faked messages, 36
+`web_search`, 68 `page_reader`, 210 `ambient`), plus both paths verified end-to-end
 against the real API — text and an image correctly described, $0.0001–0.002 a reply. `agent_context.md` is read
 at startup only — there is deliberately no reload command, so a personality edit needs a
 restart.
 
-**Ambient replies are built and offline-verified only** (2026-08-22): `ambient.py` plus its
-`bot.py` wiring, 154 checks covering the buffer, every named refusal, the debounce and its
-deadline, verdict parsing, reply shaping and both mid-flight aborts. Never run against real
-Discord or a real gate model, so the judge's calibration is guesswork until observe mode
-has run for a few days — `AMBIENT_THRESHOLD=70` is a starting point, not a measured one.
+**Ambient replies are built, offline-verified, and the gate is calibrated** (2026-08-26):
+`ambient.py` plus its `bot.py` wiring, 210 checks covering the buffer, every named refusal,
+the debounce and its deadline, verdict parsing, reply shaping, the gate prompt file and both
+mid-flight aborts. The gate itself has now been run against real models through the real
+`run_ambient` — `agentic/tools/probe_gate.py`, eight transcripts with known answers — and
+`mistralai/mistral-nemo` separates them by 20 points on the current template, which puts
+`AMBIENT_THRESHOLD=50` in the middle of the gap rather than on a guess. The *reply* half
+has still never run against real Discord.
 
 **`search_web` and `read_page` are offline-verified only** (2026-08-16): request contract,
 error mapping, redirect and address guards, rationing and the dispatcher are all covered
