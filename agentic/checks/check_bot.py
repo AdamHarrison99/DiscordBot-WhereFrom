@@ -43,13 +43,26 @@ class Msg:
         self.replies, self.reactions = [], []
 
 
-def bot_message(id=500, attachments=()):
-    """A message authored by the bot, as `reference.resolved` would give it."""
-    m = B.discord.Message.__new__(B.discord.Message)
-    m.author = types.SimpleNamespace(id=BOT_ID, bot=True)
+class Replied(B.discord.Message):
+    """A stand-in for the message a reply points at. clean_content on a real one
+    wants the whole connection state, so here it is the text as given."""
+    clean_content = property(lambda self: self.content)
+
+
+def replied_message(id=500, attachments=(), author_id=BOT_ID, text="",
+                    display_name=None):
+    m = Replied.__new__(Replied)
+    m.author = types.SimpleNamespace(id=author_id, bot=author_id == BOT_ID,
+                                     display_name=display_name or f"user{author_id}")
     m.attachments = list(attachments)
+    m.content = text
     m.id = id
     return m
+
+
+def bot_message(id=500, attachments=()):
+    """A message authored by the bot, as `reference.resolved` would give it."""
+    return replied_message(id=id, attachments=attachments)
 
 
 def ref(resolved=None, message_id=None):
@@ -63,8 +76,7 @@ NICK = f"<@!{BOT_ID}>"
 check("plain mention detected", B.mentions_bot(Msg(f"{MENTION} hello")))
 check("nickname form detected", B.mentions_bot(Msg(f"{NICK} hello")))
 check("no mention -> False", not B.mentions_bot(Msg("hello")))
-# The regression: Discord lists the replied-to author in `mentions`, so a reply
-# to one of our messages arrives looking mentioned without any @ in the text.
+# The regression: Discord lists the replied-to author in `mentions`.
 reply_to_bot = Msg("thanks!", mentions=[types.SimpleNamespace(id=BOT_ID)])
 check("reply to bot is NOT a mention", not B.mentions_bot(reply_to_bot))
 check("other user's mention ignored", not B.mentions_bot(Msg("<@999> hi")))
@@ -133,9 +145,7 @@ check("reply to bot handled",
 check("reply forwarded", calls == [("user1: what about the other one?", [], [])])
 
 calls.clear()
-other = B.discord.Message.__new__(B.discord.Message)
-other.author = types.SimpleNamespace(id=999, bot=False)
-other.attachments = []
+other = replied_message(id=600, author_id=999)
 check("reply to someone else ignored",
       asyncio.run(run(Msg("ok", reference=ref(resolved=other)))) is False)
 check("no API call for a reply to someone else", calls == [])
@@ -220,12 +230,8 @@ asyncio.run(run(Msg(f"{MENTION} look", attachments=[doc])))
 check("non-image attachment dropped", calls == [("user1: look", [], [])])
 
 # --- images on the replied-to message are picked up ---
-def bot_message_with(images=(), author_id=BOT_ID):
-    m = B.discord.Message.__new__(B.discord.Message)
-    m.author = types.SimpleNamespace(id=author_id, bot=author_id == BOT_ID)
-    m.attachments = list(images)
-    m.id = 501
-    return m
+def bot_message_with(images=(), author_id=BOT_ID, text=""):
+    return replied_message(id=501, attachments=images, author_id=author_id, text=text)
 
 calls.clear(); fresh_throttle(); fresh_memory()
 old = bot_message_with([img], author_id=777)          # someone else's image
@@ -242,6 +248,31 @@ check("own image first, replied-to image after",
 calls.clear(); fresh_throttle(); fresh_memory()
 asyncio.run(run(Msg(f"{MENTION} again", attachments=[img], reference=ref(resolved=old))))
 check("the same image isn't sent twice", calls[0][1] == ["https://cdn/x.png"])
+
+# --- the message being replied to is context, even when memory never saw it ---
+calls.clear(); fresh_throttle(); fresh_memory()
+unprompted = replied_message(id=700, text="I said this unprompted")
+asyncio.run(run(Msg("what did you mean?", reference=ref(resolved=unprompted))))
+check("a reply to an unremembered bot message carries it",
+      calls[0][2] == [{"role": "assistant", "content": "I said this unprompted"}])
+
+calls.clear(); fresh_throttle(); fresh_memory()
+B.conversations.remember(10, "assistant", "I said this unprompted", message_id=700)
+asyncio.run(run(Msg("what did you mean?", reference=ref(resolved=unprompted))))
+check("a message already in memory isn't sent twice",
+      [m["content"] for m in calls[0][2]] == ["I said this unprompted"])
+
+calls.clear(); fresh_throttle(); fresh_memory()
+someone = replied_message(id=701, author_id=888, text="the thing being asked about",
+                          display_name="bravo")
+asyncio.run(run(Msg(f"{MENTION} is that right", reference=ref(resolved=someone))))
+check("a reply to someone else carries their message, named",
+      calls[0][2] == [{"role": "user", "content": "bravo: the thing being asked about"}])
+
+calls.clear(); fresh_throttle(); fresh_memory()
+imageonly = replied_message(id=702, attachments=[img], text="")
+asyncio.run(run(Msg(f"{MENTION} where from", reference=ref(resolved=imageonly))))
+check("an image-only replied message adds no empty turn", calls[0][2] == [])
 
 # --- memory carries across messages, and is per channel ---
 calls.clear(); fresh_throttle(); fresh_memory()
@@ -347,8 +378,7 @@ check("tool exception does not escape",
 check("no link recorded when the search fails", B.SourceFinder("u", "t").top_link is None)
 
 # --- model selection ---
-# load_dotenv() repopulates from the real .env on reload and only skips keys
-# already present, so "unset" is exercised as blank - the same env_str branch.
+# "unset" is exercised as blank: load_dotenv would repopulate a real value.
 def reload_models(text="", image="", base="openrouter/auto"):
     os.environ["OPENROUTER_TEXT_MODEL"] = text
     os.environ["OPENROUTER_MEDIA_MODEL"] = image
@@ -392,8 +422,7 @@ check("blank entries are ignored",
 # OpenRouter's "latest" alias prefix; stripping it makes the id invalid.
 check("a leading ~ survives parsing",
       reload_models(text="~ex/model-latest")[0] == ("~ex/model-latest", FREE))
-# The free router has no vision endpoint, so appending it to the image chain would
-# only turn a busy paid model into "your backend is misconfigured".
+# The free router has no vision endpoint to append to the image chain.
 check("the image chain gets no free fallback",
       reload_models(image="a/vision,b/vision")[1] == ("a/vision", "b/vision"))
 check("the text chain still does",
@@ -789,8 +818,7 @@ check("audio-only asks about audio", B.DESCRIBE_AUDIO_QUESTION != B.DESCRIBE_IMA
 check("the audio question mentions audio", "audio" in B.DESCRIBE_AUDIO_QUESTION.lower())
 
 
-# aiohttp's read(n) hands back only what is buffered, so the body has to be
-# looped over - a short read is a truncated clip and the model hears static.
+# aiohttp's read(n) hands back only what is buffered: the body needs a loop.
 class Body:
     def __init__(self, chunks): self.chunks = chunks
     async def iter_chunked(self, n):

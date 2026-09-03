@@ -1,19 +1,11 @@
-"""Does a gate model actually score your criteria, or only check whether it was addressed?
+"""Scores a gate model against scenarios with known answers. Costs gate calls.
 
-The ambient gate lives or dies on the model behind it, and the catalogue can't tell
-you which kind you have. This drives the real path - fake Discord messages through
-to_record, the real buffer, the real run_ambient - so what reaches the model is what
-production sends, and the score read back is the one the log line carries.
+Read agentic/tools/README.md before reading the grid.
 
+Usage:
     .venv/Scripts/python.exe agentic/tools/probe_gate.py
     .venv/Scripts/python.exe agentic/tools/probe_gate.py <model> <model> --trials 5
     .venv/Scripts/python.exe agentic/tools/probe_gate.py --show
-
-Uses judge_template.md, or whatever JUDGE_TEMPLATE_FILE points at. The threshold is
-raised out of reach first, so a scenario is scored but never answered - the grid
-costs gate calls only. Prints a score per scenario per trial, then whether the model
-separates what should be answered from what should be ignored. A model scoring
-everything 0 and one scoring everything 90 are equally useless. About a cent a model.
 """
 import argparse, asyncio, logging, os, sys, types
 from pathlib import Path
@@ -58,12 +50,14 @@ class Attachment:
 
 class Msg:
     """What discord.py hands to on_message, reduced to what to_record reads."""
-    def __init__(self, text, who=1, is_bot=False, mid=1, attachments=()):
+    def __init__(self, text, who=1, is_bot=False, mid=1, attachments=(), replying_to=None):
         self.content = self.clean_content = text
         self.author = types.SimpleNamespace(
             id=who, bot=is_bot, display_name="thisbot" if is_bot else "user" + str(who))
         self.attachments = list(attachments)
         self.channel, self.id, self.guild = CHAN, mid, object()
+        self.reference = (types.SimpleNamespace(message_id=replying_to)
+                          if replying_to is not None else None)
 
 
 # Invented, never anybody's real messages. "speak" means a reply would be welcome.
@@ -93,6 +87,18 @@ SCENARIOS = (
     ("private aside", "silent", lambda: [
         Msg("user2 did you send that form off yet"),
         Msg("doing it tonight", who=2, mid=2)]),
+    # The transcript marks what answers what: this question has had its answer.
+    ("already answered", "silent", lambda: [
+        Msg("anyone know why the kettle keeps tripping the breaker"),
+        Msg("worn element, usually - it draws more as it goes",
+            who=BOT_ID, is_bot=True, mid=2, replying_to=1),
+        Msg("that would explain it", who=2, mid=3)]),
+    # Same shape, but the follow-up is a new question nobody has taken.
+    ("answered then asked again", "speak", lambda: [
+        Msg("anyone know why the kettle keeps tripping the breaker"),
+        Msg("worn element, usually - it draws more as it goes",
+            who=BOT_ID, is_bot=True, mid=2, replying_to=1),
+        Msg("is that worth fixing or do i just buy a new one", who=2, mid=3)]),
 )
 
 
@@ -180,10 +186,11 @@ async def main(args):
             print("  -> $" + format(spend, ".4f") + "\n")
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument("models", nargs="*")
-parser.add_argument("--trials", type=int, default=3)
-parser.add_argument("--show", action="store_true", help="print one built prompt and stop")
-args = parser.parse_args()
-args.models = args.models or list(B.AMBIENT_GATE_MODEL)
-asyncio.run(main(args))
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("models", nargs="*")
+    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--show", action="store_true", help="print one built prompt and stop")
+    args = parser.parse_args()
+    args.models = args.models or list(B.AMBIENT_GATE_MODEL)
+    asyncio.run(main(args))

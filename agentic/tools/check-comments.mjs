@@ -6,6 +6,10 @@
  *   node agentic/tools/check-comments.mjs                         lines this branch changed
  *   COMMENT_LINT_BASE=HEAD node agentic/tools/check-comments.mjs   uncommitted work only
  *   node agentic/tools/check-comments.mjs <path>                   whole-file scan
+ *   node agentic/tools/check-comments.mjs .                        the whole repo
+ *
+ * Bare, it only sees the lines this branch changed - it reports clean while the
+ * rest of the tree is dirty. An audit passes a path.
  *
  * Exit 0 clean, 1 violations found, 2 usage error.
  */
@@ -21,10 +25,22 @@ const BANNED = [
   'which is why', 'the reason', 'used to', 'previously', 'would have',
 ];
 
+// A comment is context, not an explanation: one line, two at the outside.
 const MAX_RUN = 2;
+const MAX_COMMENT_CHARS = 120;
+
+// A docstring says what something is. What it is for goes in agentic/CLAUDE.md.
+const MAX_DOC_LINES = 2;
+const MAX_DOC_CHARS = 160;
+
+// A module docstring orients a reader arriving at the file, so it gets a little more.
+const MAX_MODULE_DOC_LINES = 3;
+const MAX_MODULE_DOC_CHARS = 200;
+
 const SOURCE_EXT = new Set(['.cs', '.mjs', '.js', '.ts', '.ps1', '.py']);
 
-const EXCLUDED_DIRS = new Set(['bin', 'obj', '.git', 'node_modules', '.vs']);
+const EXCLUDED_DIRS = new Set(['bin', 'obj', '.git', 'node_modules', '.vs',
+                               '.venv', 'venv', '__pycache__']);
 
 function isSource(path) {
   const dot = path.lastIndexOf('.');
@@ -103,25 +119,99 @@ function commentLines(text) {
   return out;
 }
 
+const DEF_RE = /^\s*(async\s+)?(def|class)\b/;
+const QUOTE_RE = /^(?:[rbuf]{0,2})("""|''')/i;
+
+// Python docstrings. A def's signature can span lines, so the colon ends it.
+function pythonDocstrings(text) {
+  const lines = text.split('\n');
+  const out = [];
+  let expect = 'module';
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+
+    if (expect === 'module') {
+      // Anything real before the string means the module has no docstring.
+      if (trimmed.startsWith('#')) continue;
+      expect = QUOTE_RE.test(trimmed) ? 'read' : null;
+      if (expect === 'read') { i = readDoc(lines, i, 'module', out) ; expect = null; }
+      continue;
+    }
+
+    if (DEF_RE.test(trimmed)) {
+      let j = i;
+      while (j < lines.length && !lines[j].trimEnd().endsWith(':')) j++;
+      let k = j + 1;
+      while (k < lines.length && !lines[k].trim()) k++;
+      if (k < lines.length && QUOTE_RE.test(lines[k].trim())) {
+        i = readDoc(lines, k, 'def', out);
+      }
+    }
+  }
+  return out;
+}
+
+function readDoc(lines, start, kind, out) {
+  const quote = QUOTE_RE.exec(lines[start].trim())[1];
+  const first = lines[start].trim().replace(QUOTE_RE, '');
+  if (first.trimEnd().endsWith(quote)) {
+    out.push({ n: start + 1, kind, body: [first.slice(0, -quote.length).trim()] });
+    return start;
+  }
+  const body = [first.trim()];
+  let i = start + 1;
+  for (; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.endsWith(quote)) {
+      body.push(t.slice(0, -quote.length).trim());
+      break;
+    }
+    body.push(t);
+  }
+  out.push({ n: start + 1, kind, body });
+  return i;
+}
+
+function bannedIn(text) {
+  const hits = [];
+  for (const word of BANNED) {
+    // Word-boundary match; multi-word entries tolerate a line break.
+    const re = new RegExp(`\\b${word.replace(/ /g, '\\s+')}\\b`, 'i');
+    if (re.test(text)) hits.push(word);
+  }
+  return hits;
+}
+
 function check(file, only) {
   const rel = relative(ROOT, file).split(sep).join('/');
   const text = readFileSync(file, 'utf8');
-  const comments = commentLines(text);
   const violations = [];
-
   const inScope = (n) => !only || only.has(n);
 
+  const comments = commentLines(text);
   // Trap lines are exempt. The run rule targets "//" lines; a block comment is one construct.
   const exempt = (c) => c.text.startsWith('!') || c.kind !== 'line';
 
   let run = [];
   const flushRun = () => {
-    if (run.length > MAX_RUN && inScope(run[0].n)) {
-      violations.push({
-        line: run[0].n,
-        rule: 'comment-run',
-        message: `${run.length} consecutive comment lines (max ${MAX_RUN}) - this is rationale, move it to agentic/CLAUDE.md`,
-      });
+    if (run.length && inScope(run[0].n)) {
+      if (run.length > MAX_RUN) {
+        violations.push({
+          line: run[0].n,
+          rule: 'comment-run',
+          message: `${run.length} consecutive comment lines (max ${MAX_RUN}) - this is rationale, move it to agentic/CLAUDE.md`,
+        });
+      }
+      const chars = run.map((c) => c.text).join(' ').length;
+      if (chars > MAX_COMMENT_CHARS) {
+        violations.push({
+          line: run[0].n,
+          rule: 'comment-length',
+          message: `${chars}-character comment (max ${MAX_COMMENT_CHARS}) - say less, or move it to agentic/CLAUDE.md`,
+        });
+      }
     }
     run = [];
   };
@@ -129,27 +219,56 @@ function check(file, only) {
   let prev = -10;
   for (const c of comments) {
     if (exempt(c)) { flushRun(); prev = c.n; continue; }
-
     if (c.n === prev + 1) run.push(c);
     else { flushRun(); run = [c]; }
     prev = c.n;
 
     if (!inScope(c.n)) continue;
+    for (const word of bannedIn(c.text)) {
+      violations.push({
+        line: c.n,
+        rule: 'rationale-word',
+        message: `"${word}" - rationale belongs in agentic/CLAUDE.md`,
+      });
+    }
+  }
+  flushRun();
 
-    const lower = c.text.toLowerCase();
-    for (const word of BANNED) {
-      // Word-boundary match; multi-word entries tolerate a line break.
-      const re = new RegExp(`\\b${word.replace(/ /g, '\\s+')}\\b`, 'i');
-      if (re.test(lower)) {
+  if (file.endsWith('.py')) {
+    for (const doc of pythonDocstrings(text)) {
+      if (!inScope(doc.n)) continue;
+      const isModule = doc.kind === 'module';
+      // A tool's "Usage:" block is its --help text, not an explanation.
+      const usage = doc.body.findIndex((l) => /^usage:/i.test(l));
+      const prose = usage === -1 ? doc.body : doc.body.slice(0, usage);
+      const lines = prose.filter((l) => l).length;
+      const chars = prose.join(' ').trim().length;
+      const maxLines = isModule ? MAX_MODULE_DOC_LINES : MAX_DOC_LINES;
+      const maxChars = isModule ? MAX_MODULE_DOC_CHARS : MAX_DOC_CHARS;
+
+      if (lines > maxLines) {
         violations.push({
-          line: c.n,
+          line: doc.n,
+          rule: 'docstring-lines',
+          message: `${lines}-line docstring (max ${maxLines}) - it is documenting, move it to agentic/CLAUDE.md`,
+        });
+      }
+      if (chars > maxChars) {
+        violations.push({
+          line: doc.n,
+          rule: 'docstring-length',
+          message: `${chars}-character docstring (max ${maxChars}) - say what it is, not why`,
+        });
+      }
+      for (const word of bannedIn(prose.join(' '))) {
+        violations.push({
+          line: doc.n,
           rule: 'rationale-word',
-          message: `"${word}" - rationale belongs in agentic/CLAUDE.md`,
+          message: `"${word}" in a docstring - rationale belongs in agentic/CLAUDE.md`,
         });
       }
     }
   }
-  flushRun();
 
   return violations.length ? { file: rel, violations } : null;
 }

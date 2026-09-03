@@ -1,16 +1,10 @@
-"""Does a model actually answer about media, and does it still reach for a tool?
+"""Tries a model on a clip, a picture, and a picture it should look up. Costs cents.
 
-The catalogue can't tell you: a model that refuses and one that works advertise the
-same input_modalities and the same tools support. Only trying it settles it, so run
-this against any id before putting it in OPENROUTER_IMAGE_MODEL or
-OPENROUTER_AUDIO_MODEL.
+Modes and their reading: agentic/tools/README.md.
 
+Usage:
     .venv/Scripts/python.exe agentic/tools/probe_media.py
     .venv/Scripts/python.exe agentic/tools/probe_media.py <model> --mode image --trials 6
-
-Modes: audio hears a spoken clip, image sees a picture, source asks where a picture
-came from and looks for a find_image_source call. Costs a few cents. Refusals are
-intermittent, so one trial per arm proves nothing.
 """
 import argparse, asyncio, base64, json, os, struct, subprocess, sys, zlib
 from pathlib import Path
@@ -128,15 +122,16 @@ async def main(args):
                 print()
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument("models", nargs="*")
-parser.add_argument("--mode", choices=("audio", "image", "source"), default="audio")
-parser.add_argument("--clip", help="audio file to send instead of synthesised speech")
-parser.add_argument("--trials", type=int, default=4)
-parser.add_argument("--arms", choices=("both", "tools", "notools"), default="both")
-parser.add_argument("--ask", help="question to send instead of the mode's default")
-args = parser.parse_args()
-args.models = args.models or list(
-    B.OPENROUTER_AUDIO_MODEL if args.mode == "audio" else B.OPENROUTER_IMAGE_MODEL
-)
-asyncio.run(main(args))
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("models", nargs="*")
+    parser.add_argument("--mode", choices=("audio", "image", "source"), default="audio")
+    parser.add_argument("--clip", help="audio file to send instead of synthesised speech")
+    parser.add_argument("--trials", type=int, default=4)
+    parser.add_argument("--arms", choices=("both", "tools", "notools"), default="both")
+    parser.add_argument("--ask", help="question to send instead of the mode's default")
+    args = parser.parse_args()
+    args.models = args.models or list(
+        B.OPENROUTER_AUDIO_MODEL if args.mode == "audio" else B.OPENROUTER_IMAGE_MODEL
+    )
+    asyncio.run(main(args))

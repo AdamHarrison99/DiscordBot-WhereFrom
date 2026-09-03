@@ -16,3 +16,6 @@ agentic/tools/probe_clip.wav
 
 # Your own gate scoring; judge_template.example.md is the committed template
 judge_template.md
+
+# Your own ambient reply wording; reply_template.example.md is the committed template
+reply_template.md

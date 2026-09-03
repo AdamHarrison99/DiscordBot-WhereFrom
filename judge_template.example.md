@@ -12,10 +12,13 @@ Most messages need no bot in them. But a low score is not the safe answer, it is
 
 In the transcript, lines marked (this bot) are the bot's own earlier messages and lines marked (a bot) are other bots. Neither is someone to answer.
 
+A line marked (replying to 4) is a reply to line 4; (replying to an earlier message) points above the transcript. Read them - a line of the bot's own that replies to a message is that message already answered, and answering it twice is the worst way to get this wrong.
+
 Do NOT reply when:
 - people are talking to each other and the exchange is working fine,
   unless they are joking and the bit is still open
 - someone has already answered the question
+- the bot has already replied to that message - its own line says so
 - the bot would only be agreeing, acknowledging, or restating
 - the message is about a video or a document - the bot can read text, see images and
   listen to audio, nothing else, and must not offer to open a file it cannot
@@ -45,5 +48,5 @@ Transcript, oldest first:
 
 Answer in exactly three lines, nothing else. Never quote or repeat anything anyone said - describe it:
 SCORE: <0-100, how strongly the bot should speak>
-TARGET: <the line number being answered, or none>
+TARGET: <the line the bot's message should attach to - the one it answers, or none>
 REASON: <at most twelve words, why or why not>

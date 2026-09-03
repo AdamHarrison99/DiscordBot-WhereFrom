@@ -45,8 +45,8 @@ and get nothing.
 Turning it on sends unaddressed messages to OpenRouter, which is a real change: until now
 only messages aimed at the bot ever left the machine. Nothing anyone says is written to
 the log or to disk either way. Set `AMBIENT_MODE=observe` to watch what it *would* say for
-a few days before letting it post. DMs are excluded. It reads text and
-images only — video, audio and documents are ignored.
+a few days before letting it post. DMs are excluded. It reads text, sees images and
+listens to voice messages — video and documents are ignored.
 
 See the `AMBIENT_` block in `.env.example`.
 
@@ -84,8 +84,10 @@ Every setting lives in `.env.example`, already set to its defaults and commented
 model, spending limits, how much of the SerpApi quota chat may spend, memory length,
 logging. Delete any line to get its default back.
 
-The bot's personality is `agent_context.md`: copy `agent_context.example.md` over it and
-edit. It's read at startup, so restart to apply changes.
+Everything the model is told is a file, not code. The personality is `agent_context.md`;
+`judge_template.md` decides when the bot speaks unprompted and `reply_template.md` says how.
+Copy the matching `.example.md` over each one and edit — a clone without them falls back to
+the examples. All three are read at startup, so restart to apply changes.
 
 ## Deploying it
 

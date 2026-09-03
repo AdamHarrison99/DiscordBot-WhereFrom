@@ -36,6 +36,7 @@ than duplicating it here. This file is what the README can't tell you.
 | `chat_agent.py` | OpenRouter chat for @-mentions, the per-user throttle, and `ask_once` |
 | `ambient.py` | Deciding whether to speak unprompted: buffer, local gate, judge. No discord imports |
 | `judge_template.md` | The gate's system prompt and scoring criteria. Gitignored; `.example.md` is committed |
+| `reply_template.md` | What the ambient reply is told on top of the persona. Same deal |
 | `startup.bat` / `startup.sh` | Run the bot, creating the venv on first run |
 
 Both *image* search modules return the same normalised match dict — `title`, `link`,
@@ -133,6 +134,10 @@ behind it, not the runner itself.
   that moves; datacenter IPs get consent walls. The real answer is the YouTube Data API
   (free, 10k units/day, 1 unit a call) — deliberately not built: it needs a Google
   Cloud key, and taking on another provider was declined.
+- **`read_page` sends an honest user agent**, naming the bot and this repo. Sites that
+  wall anything non-browser let more of those through than a forged Chrome string.
+- **`normalize_matches` sorts SauceNAO's results itself.** They arrive similarity-sorted
+  by documentation only, and `build_embed` answers with `matches[0]`.
 - **SauceNAO reports failures inside a 200 response** — negative `status`, `user_id: 0` for
   a bad key, negative `short_remaining`/`long_remaining` for quota. See `_check_header`.
 - **Nothing anyone says reaches disk.** The ambient buffer and the conversation memory are
@@ -178,11 +183,11 @@ behind it, not the runner itself.
   image-shaped and nothing else in the request says otherwise.
 - **Audio counts as readable, video and documents still don't.** `other_files` now excludes
   audio, `is_readable` treats a lone voice note as a question, and the judge prompt and
-  `AMBIENT_CONTEXT_NOTE` both say the bot can listen — **and so must `agent_context.md`**,
-  which is the mention path's system prompt and is gitignored, so a fresh checkout needs it
-  edited by hand. A persona still claiming it can't hear will refuse an attached clip in the
-  bot's own voice, with the plumbing working perfectly. Adding a modality means changing all
-  five.
+  `reply_template.md`'s `# Context` both say the bot can listen — **and so must
+  `agent_context.md`**, which is the mention path's system prompt and is gitignored, so a
+  fresh checkout needs it edited by hand. A persona still claiming it can't hear will refuse
+  an attached clip in the bot's own voice, with the plumbing working perfectly. Adding a
+  modality means changing all five.
 - **A bare link doesn't buy a gate call either.** `is_readable` strips URLs and asks whether
   anything alphanumeric is left, so a pasted link alone is buffered as context but never
   judged — the ambient reply is offered no tools, so it has nothing to open a page with.
@@ -190,7 +195,7 @@ behind it, not the runner itself.
   `AMBIENT_STRICT_CONTENT` widens it to the whole message — a caption beside a video or a
   link buys no gate call either, where the default judges the caption and skips the file.
   `image_urls_in` reads attachments only, so a pasted image URL is not vision input today.
-- **The reply prompt says outright that nobody asked.** Without `AMBIENT_CONTEXT_NOTE` the
+- **The reply prompt says outright that nobody asked.** Without the `# Context` section the
   model reads the transcript as a question put to it and answers like a summoned assistant
   — greeting the channel, summarising, offering more help. The persona alone doesn't fix it.
 - **Every ambient refusal logs at INFO except one.** A quiet channel with no log line
@@ -198,10 +203,40 @@ behind it, not the runner itself.
   `AmbientLimits` reasons are all INFO. Only "not an enabled channel" stays DEBUG — it
   fires on every message in every channel of every guild. The startup line names the
   enabled channel ids for the same reason: a count can't be checked against a config.
-- **The gate's wording is a file, not code.** `judge_template.md` holds a `# System` and
-  a `# Template` section; `parse_judge_file` rejects anything missing either, or a template
-  with no `{transcript}`. Placeholders are **replaced, not `str.format`ed** — a hand-edited
-  file may hold braces, and a stray one would otherwise raise. It is gitignored like
+- **The transcript carries reply structure, or the gate re-answers the same message.**
+  `MessageRecord.reply_to` is the referenced message id and `build_transcript` renders
+  `(replying to 3)` — `(replying to an earlier message)` when the parent is above the
+  window. Without it the transcript is a flat numbered list, so "someone has already
+  answered that" is unjudgeable and `TARGET` is chosen blind: the gate kept pointing at a
+  question the bot had already replied to, because nothing in its input said so.
+  `usable_target` is the backstop — a target the bot has answered (its own reply names it)
+  or one of its own messages is dropped, keeping the score, so the reply still lands but
+  as a plain send. `answered_ids` needs no extra state: the bot's own reply *is* the record.
+- **The reply header follows the judged snapshot, not the live buffer.** `post_ambient`
+  compares the target against `records[-1]`. Against `ambient_buffer.newest_id` a message
+  arriving mid-flight turned a plain send into a reply pointing at the message that had
+  been newest.
+- **The two reply paths keep separate memories, and only ambient writes to both.**
+  `ambient.ChannelBuffer` is the channel transcript; `chat_agent.Conversation` is what the
+  mention path sends. Nothing bridged them, so a reply to an unprompted message reached the
+  model with the message it was answering missing entirely. `post_ambient` now records the
+  exchange — the bot's line plus the message it answered — into `conversations` once the
+  send succeeds. Turns carry the discord message id, and `Conversation.knows` is asked
+  before `with_replied_context` adds the replied-to message, so the ordinary case of
+  replying to the answer just given doesn't send it twice. Compared by id, not by text: an
+  ambient plain send carries an `<@id>` prefix the memory line doesn't have.
+- **`build_reply_history` annotates other people's turns only.** A turn answering
+  something other than the line above it gets `(replying to bravo)`, or `(replying to you)`
+  for the bot's own message. Not on assistant turns: the model reads those as its own
+  wording and imitates the parenthetical.
+- **The gate's wording is a file, not code, and so is the reply's.**
+  `judge_template.md` holds a `# System` and a `# Template` section;
+  `reply_template.md` holds `# Context` and `# Instruction` — what `AMBIENT_CONTEXT_NOTE`
+  and `REPLY_INSTRUCTION` used to hold in the module. `parse_sections` splits on the
+  headings asked for and nothing else, so a stray `#` in a hand-edited body stays part of
+  that body; `parse_judge_file` also rejects a template with no `{transcript}`.
+  Placeholders are **replaced, not `str.format`ed** — a hand-edited file may hold braces,
+  and a stray one would otherwise raise. It is gitignored like
   `agent_context.md`, and `judge_template.example.md` is both the committed template and the
   fallback a fresh clone actually runs on, so an edit to the example changes behaviour for
   anyone who never made their own. Read at startup only, as `utf-8-sig` and stripped
@@ -272,13 +307,18 @@ behind it, not the runner itself.
   against whatever the last section left behind — `bot.user`, `answer_mention` and the
   feature flags are all swapped mid-file. Put a check beside the section whose state it
   needs, not at the bottom.
+- **A check can't test an unset var, only a blank one.** `load_dotenv()` repopulates from
+  the real `.env` on reload and skips only keys already present, so `reload_models` sets
+  the blank string — the same `env_str` branch an absent key takes.
 - **Checks import `bot.py`, which calls `load_dotenv()`, so a developer's `.env` steers
   them.** `AMBIENT_STRICT_CONTENT=true` in a real `.env` silently flipped four eligibility
   checks. Pin any flag a check depends on rather than trusting the default.
 - **`bot.py` reads env at import time** (`os.environ[...]`). Importing it without
   `DISCORD_BOT_TOKEN` / `SERPAPI_KEY` set raises `KeyError`. Set dummies to import in tests.
 - **Logging goes through a `QueueListener`** so disk writes never block the event loop, and
-  the formatters redact `api_key=`/`token=` params. Don't switch to `basicConfig` — it
+  the formatters redact `api_key=`/`token=` params — `SECRET_PARAM`. At the formatter, not
+  at the call sites: nothing logs a full request URL today, but a single
+  `raise_for_status()` would start, since aiohttp puts the URL in `ClientResponseError`. Don't switch to `basicConfig` — it
   double-formats every record through the QueueHandler.
 - **Mention replies cost money, deliberately.** `openrouter/auto` routes to paid models;
   ~$0.0001–0.0008 per reply, logged per call. This was a considered switch away from
@@ -357,6 +397,26 @@ behind it, not the runner itself.
 - **OpenRouter fetches image URLs server-side, and some hosts refuse it.** `python.org`
   returns 403 to their fetcher — it looks like a vision failure but isn't. Discord CDN URLs
   are fine; `raw.githubusercontent.com` is a good test host.
+- **The client sets `allowed_mentions` so nothing in a match can ping.** Titles and
+  snippets come from arbitrary web pages, so an `@everyone` in one would otherwise reach
+  the whole server. `replied_user` stays on, which is what notifies whoever asked — and is
+  why the ambient path has to override it per message.
+- **The top link is put back after the model answers.** A source lookup is the link, and
+  models paraphrase it away ("it's from Wikipedia"), so `answer_mention` appends
+  `tools.top_link` when the reply doesn't already carry it. Prompting alone didn't hold.
+- **Lens's 15s timeout is a hung-request backstop, not the expected duration.** SerpApi
+  answers in 2-4s and the target is a reply inside ~5s; don't read 15 as a budget.
+- **`count_newer` counts by message id, never by buffer length.** The deque stops growing
+  once it is full, so a length comparison reads "nothing arrived" during exactly the burst
+  `AMBIENT_STALE_MESSAGES` exists to catch.
+- **`atexit` runs LIFO, and the `QueueListener`'s `stop()` depends on it.** `logging`
+  registers its own shutdown when first imported, so the listener must register *after* it
+  to drain the queue before the handlers underneath are closed.
+- **Lens finding nothing and Lens finding nothing *linkable* are logged apart.** Both look
+  like an empty result downstream and they need different digging.
+- **`MentionThrottle` is per user because every other limit is account-wide.** The daily
+  budget and the month's SerpApi quota are shared, so without a per-user window one person
+  can spend the whole server's allowance.
 - **`message.mentions` includes the replied-to author**, so a plain reply to one of the
   bot's own messages arrives looking like a mention. `mentions_bot()` checks the literal
   `<@id>` in the content instead — without that, every "thanks!" reply bought an API call.
@@ -365,6 +425,11 @@ behind it, not the runner itself.
   `process_commands` once a mention is handled.
 
 ## Constraints on testing
+
+- **The probe tools now run under a `__main__` guard — they didn't.** `probe_gate.py` and
+  `probe_media.py` had their argparse and `asyncio.run(main())` at module level, so
+  *importing* one to inspect its fixtures ran the whole probe and billed for it. Both are
+  guarded now; keep it that way if you add another.
 
 - **SerpApi free tier is 100 searches/month**, now shared between Lens and the agent's
   `search_web`. Every live call burns quota permanently. Prefer offline tests
@@ -385,23 +450,50 @@ behind it, not the runner itself.
 
 - READMEs end with this AI disclosure line:
   `*This project was built with AI code development tools ([Claude Code](https://www.anthropic.com/claude-code)).*`
+- **Prompt wording never goes in the code.** Anything the model reads as instruction or
+  persona — a system prompt, a context note, the sentence that tells it how to behave —
+  lives in a `.md` file the bot reads at startup, never as a string constant in a `.py`.
+  Tuning wording is not editing code and must not need a commit or a diff review; a
+  constant in a module also can't be swapped per deployment. Each such file is gitignored
+  with a committed `.example.md` beside it that a fresh clone falls back to
+  (`agent_context.md`, `judge_template.md`, `reply_template.md`). Adding a new prompt means
+  adding a new file and a `*_FILE` env var, not a new constant. Short fixed strings the
+  *transcript* is built from — the attachment marks, the speaker tags — are formatting the
+  code owns, not wording addressed to the model.
 - **Code comments are short.** One line, why not what, only where the code can't say it
-  itself. No comment beats a redundant one. Docstrings are one line unless the function
-  genuinely needs more. Don't write documentation in the code — it goes here or in the
-  README. `node agentic/tools/check-comments.mjs` flags the lines that break this.
+  itself. No comment beats a redundant one. A docstring says what a thing is; what it is
+  for goes here. Don't write documentation in the code — it goes here or in a README.
+  `agentic/tools/check-comments.mjs` measures it; the audit below runs it.
 - `.env.example` and `agent_context.example.md` are committed templates for gitignored
   files. Add new vars to the example with a comment explaining what each one buys you.
   `agent_context.md` is deliberately *not* a copy of its example — don't sync them.
-- **Auditing before a commit includes a PII strip.** Read the tracked tree — not only the
-  diff — for anything that identifies a person or a machine: names, emails, handles, server
-  or channel ids, absolute paths from a developer's disk, API keys, and quoted messages.
-  Commit messages count; so do comments, docstrings, fixtures and example files. Do it by
-  reading and reasoning, not with a word list — a blacklist passes the thing it hasn't seen.
 - **Memories go in `agentic/memory/`**, never in a per-session store outside the repo —
   one file per fact, linked from `memory/MEMORY.md`. They're published like everything
   else here, so write the rule, not who asked for it or when.
 - Keep this document lean. Information has to earn its place: no change logs, no reasoning
   narratives, no restating the README or the code.
+
+## Auditing before a commit
+
+Every gate reads the **tracked tree**, not the diff. A diff-shaped audit passes anything
+the diff didn't touch, which is most of what is wrong.
+
+1. **The checks.** All five in `agentic/checks/`, from the repo root with the venv python.
+   Every one prints its own total; a new check has to be added above the summary print.
+2. **The comment gate.** `node agentic/tools/check-comments.mjs .` — with the path. Bare it
+   only sees lines this branch changed and reports clean over a dirty tree. Limits: 2
+   consecutive comment lines, 120 characters a block, 2-line/160-character docstrings (3
+   and 200 for a module), and a list of rationale words that mark a comment which has
+   become an argument. `agentic/tools/README.md` has the table. A hit is fixed by saying
+   less or by moving the sentence here — never by loosening the tool.
+3. **The PII strip.** Anything identifying a person or a machine: names, emails, handles,
+   server or channel ids, absolute paths from a developer's disk, API keys, and quoted
+   messages. Commit messages count; so do comments, docstrings, fixtures and examples. Do
+   it by reading and reasoning, not with a word list — a blacklist passes what it hasn't
+   seen.
+4. **The prompt-wording rule.** No instruction or persona text added to a `.py`.
+5. **Discrimination.** A new check that passes against the unfixed code is not evidence.
+   Break the fix, watch the specific check fail, put it back.
 
 ## Status
 
@@ -411,14 +503,14 @@ is unit-tested offline. The SauceNAO fallback landed after that and has **not** 
 verified live.
 
 **@-mention chat is built and works live** (`chat_agent.py`, `plans/MENTION_AGENT_PLAN.md`).
-675 offline checks (142 `chat_agent`, 219 `bot.py` wiring against faked messages, 36
-`web_search`, 68 `page_reader`, 210 `ambient`), plus both paths verified end-to-end
+737 offline checks (150 `chat_agent`, 223 `bot.py` wiring against faked messages, 36
+`web_search`, 68 `page_reader`, 260 `ambient`), plus both paths verified end-to-end
 against the real API — text and an image correctly described, $0.0001–0.002 a reply. `agent_context.md` is read
 at startup only — there is deliberately no reload command, so a personality edit needs a
 restart.
 
 **Ambient replies are built, offline-verified, and the gate is calibrated** (2026-08-26):
-`ambient.py` plus its `bot.py` wiring, 210 checks covering the buffer, every named refusal,
+`ambient.py` plus its `bot.py` wiring, 260 checks covering the buffer, every named refusal,
 the debounce and its deadline, verdict parsing, reply shaping, the gate prompt file and both
 mid-flight aborts. The gate itself has now been run against real models through the real
 `run_ambient` — `agentic/tools/probe_gate.py`, eight transcripts with known answers — and

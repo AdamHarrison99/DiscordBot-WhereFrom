@@ -35,8 +35,7 @@ class WebAuthError(WebSearchError):
 
 
 class WebNoResults(WebSearchError):
-    """The search ran fine and Google matched nothing. Reported through the
-    `error` field rather than an empty result set, as with Lens."""
+    """The search ran fine and Google matched nothing."""
 
 
 class WebBadQuery(WebSearchError):
@@ -94,9 +93,9 @@ def _classify_error(error: str, status: int) -> WebSearchError:
 
 
 def normalize_results(payload: dict) -> list[dict]:
-    """Organic results as title, link, snippet, source - the shape the tool
-    result text is built from. Not the reverse-image match shape; nothing here
-    reaches build_embed."""
+    """Organic results as title, link, snippet, source, for the tool text.
+
+    Not the reverse-image match shape."""
     results = []
     for result in payload.get("organic_results") or []:
         link = result.get("link")

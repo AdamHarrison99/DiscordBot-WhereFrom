@@ -1,8 +1,7 @@
-"""SauceNAO reverse image search, used when Google Lens comes back empty.
+"""SauceNAO reverse image search, for when Google Lens comes back empty.
 
-Lens misses the illustration and anime sources SauceNAO indexes directly
-(Pixiv, Danbooru, yande.re, Twitter). Free tier: 100/day, 6 per 30s.
-Results are normalised to the same shape lens_search produces.
+It indexes the illustration sources Lens misses. Free tier: 100/day, 6 per 30s.
+Matches come back in lens_search's shape.
 """
 
 from __future__ import annotations
@@ -16,9 +15,7 @@ SAUCENAO_URL = "https://saucenao.com/search.php"
 ALL_DATABASES = 999
 JSON_OUTPUT = 2
 
-# hide=0 disables SauceNAO's own explicit-content filtering. Set explicitly so
-# results don't depend on the account's default, which would silently drop
-# sources from the boorus that make this fallback worth having.
+# hide=0 disables SauceNAO's own filtering - see agentic/CLAUDE.md.
 HIDE_NOTHING = 0
 
 # Anything below this is almost always an unrelated image that happens to
@@ -103,8 +100,7 @@ def _check_header(header: dict, api_key: str) -> None:
     if _as_int(header.get("user_id")) == 0 and api_key:
         raise SauceAuthError("SauceNAO did not accept the API key")
 
-    # Negative remaining means that window is used up. Naming the window makes
-    # the log actionable: the 30s one clears itself, the daily one doesn't.
+    # Negative remaining means that window is spent. The log names which.
     for field, window in (("short_remaining", "30-second"), ("long_remaining", "daily")):
         remaining = _as_int(header.get(field))
         if remaining is not None and remaining < 0:
@@ -160,8 +156,7 @@ async def search_saucenao(
         if match and match["similarity"] >= min_similarity:
             matches.append(match)
 
-    # SauceNAO documents results as similarity-sorted, but the embed picks
-    # matches[0] as the answer, so don't stake that on an external invariant.
+    # The embed answers with matches[0], which is ours to guarantee.
     matches.sort(key=lambda m: m["similarity"], reverse=True)
     quota = (header.get("short_remaining"), header.get("long_remaining"))
     return matches, quota

@@ -1,10 +1,7 @@
 """Fetch a URL and turn it into text for the chat agent.
 
-No API, no key, no quota - just an HTTP GET - so the guards here are about what
-a fetch-anything tool can be pointed at rather than what it costs. The model
-supplies the URL, so a user can make the bot request any address it can reach:
-hence the public-address check on every hop, the byte cap, and the refusal to
-read anything that isn't text.
+The model supplies the URL, so the guards are about where a fetch can point: a
+public-address check per hop, a byte cap, and text types only.
 """
 
 from __future__ import annotations
@@ -33,8 +30,7 @@ MAX_REDIRECTS = 3
 
 REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
-# Some sites serve a bot wall to anything without a browser-ish agent; being
-# honest about who we are gets through more of them than a fake Chrome does.
+# An honest agent gets through more bot walls here than a fake Chrome.
 USER_AGENT = "WhereFromBot/1.0 (+https://github.com/AdamHarrison99/DiscordBot-WhereFrom)"
 
 TEXT_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")
@@ -86,9 +82,7 @@ def validate_url(url: str) -> str:
 async def ensure_public(url: str) -> None:
     """Reject anything resolving to a private, loopback or reserved address.
 
-    Not airtight - aiohttp resolves the name again when it connects, so a host
-    that answers publicly here and privately a moment later still gets through.
-    See the DNS rebinding note in agentic/CLAUDE.md."""
+    Not rebinding-proof - see agentic/CLAUDE.md."""
     parts = urlsplit(url)
     host = parts.hostname or ""
     port = parts.port or (443 if parts.scheme == "https" else 80)

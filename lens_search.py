@@ -1,13 +1,6 @@
 """Google Lens reverse image search via SerpApi.
 
-SerpApi needs a publicly fetchable image URL. Discord CDN URLs already are
-one, and so is any ordinary hotlinkable image URL, so URLs are passed
-straight through. An earlier version re-uploaded non-Discord URLs to
-Catbox first; that was dropped because it broke working URLs and Catbox
-has uploads disabled (HTTP 412, "Uploads paused until I can resolve
-storage issues"). If a re-host ever becomes necessary, note that
-detecting the need costs a second SerpApi search, which matters on the
-100-searches/month free tier.
+Image URLs are passed through as-is; SerpApi fetches them itself.
 """
 
 from __future__ import annotations
@@ -16,8 +9,7 @@ import aiohttp
 
 SERPAPI_URL = "https://serpapi.com/search"
 
-# The acceptance target is a reply within ~5s. SerpApi usually answers in 2-4s,
-# so this is a backstop for a hung request rather than the expected duration.
+# A backstop for a hung request, not the expected duration.
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
@@ -36,11 +28,7 @@ class LensAuthError(LensSearchError):
 class LensNoResults(LensSearchError):
     """The search ran fine but Google Lens matched nothing.
 
-    SerpApi reports this through the `error` field rather than an empty
-    result set, so it has to be teased apart from real failures. Lens also
-    returns this when it cannot fetch the image at all - notably for
-    `upload.wikimedia.org` URLs, which silently yield nothing.
-    """
+    Also what an image Lens could not fetch at all looks like."""
 
 
 class LensBadImageUrl(LensSearchError):
@@ -96,9 +84,7 @@ def _classify_error(error: str, status: int) -> LensSearchError:
 
 
 def normalize_matches(payload: dict) -> list[dict]:
-    """Convert visual_matches to the shared match shape used by the embed:
-    title, link, source, thumbnail, similarity. Lens gives no similarity
-    score, so that stays None."""
+    """visual_matches in the shared embed shape. Lens scores no similarity."""
     matches = []
     for match in payload.get("visual_matches") or []:
         link = match.get("link")

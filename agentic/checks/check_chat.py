@@ -258,8 +258,7 @@ check("question keeps its floor", len(p.question) == ca.MIN_QUESTION_CHARS)
 check("zero budget disables trimming", ca.fit_to_budget(big, [], "q", 0) == (big, [], "q", 0))
 check("negative budget disables trimming", ca.fit_to_budget(big, [], "q", -5) == (big, [], "q", 0))
 
-# the budget is enforced in build_request, so nothing can route around it -
-# and it covers the question, never the system prompt
+# build_request enforces the budget, over the question, never the system prompt
 b = ca.build_request(big, "q" * 900, ca.AUTO_ROUTER_MODEL, 300, max_context_tokens=200)
 check("system prompt sent whole", b["messages"][0]["content"] == big)
 check("build_request enforces the budget", len(b["messages"][1]["content"]) <= 200 * CPT)
@@ -302,6 +301,28 @@ c.remember(3, "user", "x", now=0.0)
 check("forget clears", c.forget(3) and c.history(3, now=1.0) == [])
 check("forget on unknown key is False", not c.forget(999))
 check("empty content not stored", (c.remember(4, "user", "", now=0.0), c.history(4, now=0.0) == [])[1])
+
+# Ids, so the mention path can ask whether a message is already a turn.
+ided = ca.Conversation(max_turns=4, ttl_seconds=1800)
+ided.remember(1, "assistant", "said this", now=0.0, message_id=77)
+ided.remember(1, "user", "and this", now=1.0)
+check("a remembered id is known", ided.knows(1, 77))
+check("an unremembered id is not", not ided.knows(1, 78))
+check("a turn stored without an id is not known by None", not ided.knows(1, None))
+check("knows is per channel", not ided.knows(2, 77))
+check("history still carries only role and content",
+      all(set(m) == {"role", "content"} for m in ided.history(1, now=2.0)))
+
+# The message a reply points at, when the memory hasn't got it.
+turn = ca.replied_turn("alpha", "the original", from_bot=False)
+check("someone else's replied turn is a named user turn",
+      turn == {"role": "user", "content": "alpha: the original"})
+check("the bot's own replied turn is an unnamed assistant turn",
+      ca.replied_turn("wherefrom", "what I said", from_bot=True)
+      == {"role": "assistant", "content": "what I said"})
+check("a long replied message is cut",
+      len(ca.replied_turn("a", "x" * 5000, from_bot=True)["content"])
+      == ca.MAX_QUESTION_CHARS)
 off = ca.Conversation(max_turns=0, ttl_seconds=1800)
 off.remember(1, "user", "ignored", now=0.0)
 check("0 turns disables memory", off.history(1, now=0.0) == [])
@@ -326,10 +347,9 @@ class FakeResp:
     async def json(self, content_type=None): return self.payload
 
 class FakeSession:
-    """Replays queued payloads and records each outgoing body.
+    """Replays queued payloads and snapshots each outgoing body.
 
-    Snapshots it: ask() mutates one dict across rounds, so storing the
-    reference makes every recorded request look like the last one."""
+    ask() mutates one dict across rounds."""
     def __init__(self, payloads): self.payloads, self.bodies = list(payloads), []
     def post(self, url, json=None, headers=None, timeout=None):
         self.bodies.append(deepcopy(json))
@@ -385,8 +405,7 @@ except ca.ChatEmptyReply:
     check("round cap stops the loop", True)
 check("only one extra round ran", len(s3.bodies) == 2 and len(ran) == 1)
 
-# ...and the last round forbids tools. A model that spends it asking for one
-# returns empty content, and there is nothing left to post.
+# ...and the last round forbids tools, which would return empty content.
 check("first round leaves tool choice open", "tool_choice" not in s3.bodies[0])
 check("last round forbids further tool calls", s3.bodies[1].get("tool_choice") == "none")
 

@@ -1,7 +1,6 @@
-"""Live: does the agent call find_image_source itself and answer with the source?
+"""Live: does the agent call find_image_source itself and name the source?
 
-Stubs lookup_source so this costs OpenRouter tokens but NOT SerpApi quota.
-Pass --real to use the real search (spends one of 100/month).
+Stubs lookup_source: OpenRouter tokens, no SerpApi quota. --real spends one.
 """
 import asyncio, sys
 from pathlib import Path

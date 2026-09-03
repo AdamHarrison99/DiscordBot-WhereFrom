@@ -27,12 +27,10 @@ MAX_IMAGES = 4
 # One round is enough for "search, then answer", and each round is a paid call.
 MAX_TOOL_ROUNDS = 1
 
-# Tool output is appended after the budget has been applied, so cap it here.
-# Fits a page read at ~1000 tokens on the follow-up call.
+# Appended after the budget is applied, so it needs its own cap.
 MAX_TOOL_RESULT_CHARS = 4000
 
-# Three sentences is ~70 tokens; the rest is headroom for emoji and CJK, which
-# cost several tokens each. The length rule itself lives in the agent context.
+# ~70 tokens of reply, plus headroom for emoji and CJK.
 DEFAULT_MAX_TOKENS = 150
 
 DEFAULT_MAX_CONTEXT_TOKENS = 2000
@@ -41,8 +39,7 @@ DEFAULT_MAX_CONTEXT_TOKENS = 2000
 DEFAULT_MEMORY_TURNS = 10
 DEFAULT_MEMORY_MINUTES = 30
 
-# The router spans many tokenizers, so an exact count isn't possible. Four chars
-# per token is the usual approximation and errs towards over-counting English.
+# The router spans many tokenizers, so this is an approximation.
 CHARS_PER_TOKEN = 4
 
 # The question keeps at least this much even if the system prompt is oversized.
@@ -51,8 +48,7 @@ MIN_QUESTION_CHARS = 200
 APP_NAME = "WhereFrom"
 APP_URL = "https://github.com/AdamHarrison99/DiscordBot-WhereFrom"
 
-# X-Title names the app in OpenRouter's activity log; HTTP-Referer is what it
-# attributes the request to. Both go on every call.
+# OpenRouter's activity log reads both. They go on every call.
 ATTRIBUTION_HEADERS = {"HTTP-Referer": APP_URL, "X-Title": APP_NAME}
 
 
@@ -77,8 +73,7 @@ class ChatRefused(ChatError):
 
 
 class ChatEmptyReply(ChatError):
-    """Nothing to post. `detail` carries the why for the log; str() stays clean
-    because this one is shown in the channel."""
+    """Nothing to post. `detail` is for the log; str() is shown in the channel."""
 
     def __init__(self, detail: str = "") -> None:
         super().__init__("the model returned an empty reply")
@@ -120,13 +115,9 @@ def _history_chars(history: Sequence[dict]) -> int:
 def fit_to_budget(
     context: str, history: Sequence[dict], question: str, max_tokens: int
 ) -> Prompt:
-    """Budget covers the history and the question; oldest history goes first.
+    """Budget covers the history and the question, oldest history first.
 
-    The system prompt is never trimmed - it is the bot's identity and rules, and
-    a half-truncated rulebook is worse than a shorter memory. An oversized one is
-    a config problem, flagged at startup. Images aren't counted; only the model
-    knows what they cost.
-    """
+    The system prompt and the images are never counted."""
     kept = list(history)
     if max_tokens <= 0:
         return Prompt(context, kept, question, 0)
@@ -155,8 +146,7 @@ def load_agent_context(path: Path) -> str:
 
 
 class MentionThrottle:
-    """Per-user sliding window. The daily cap is account-wide, so one user can
-    otherwise drain the whole server's budget."""
+    """Per-user sliding window over the shared account limits."""
 
     def __init__(self, limit: int, window_seconds: float = 60.0) -> None:
         self.limit = limit
@@ -188,20 +178,33 @@ class Conversation:
         # One turn is a user message and its reply.
         self.max_messages = max(max_turns, 0) * 2
         self.ttl = ttl_seconds
-        self._log: dict[int, deque[tuple[float, dict]]] = {}
+        self._log: dict[int, deque[tuple[float, dict, int | None]]] = {}
 
     def history(self, key: int, now: float | None = None) -> list[dict]:
         now = time.monotonic() if now is None else now
         self._expire(key, now)
-        return [message for _, message in self._log.get(key, ())]
+        return [message for _, message, _ in self._log.get(key, ())]
 
-    def remember(self, key: int, role: str, content: str, now: float | None = None) -> None:
+    def remember(
+        self,
+        key: int,
+        role: str,
+        content: str,
+        now: float | None = None,
+        message_id: int | None = None,
+    ) -> None:
         if not self.max_messages or not content:
             return
         now = time.monotonic() if now is None else now
         self._expire(key, now)
         entries = self._log.setdefault(key, deque(maxlen=self.max_messages))
-        entries.append((now, {"role": role, "content": content}))
+        entries.append((now, {"role": role, "content": content}, message_id))
+
+    def knows(self, key: int, message_id: int | None) -> bool:
+        """Whether a discord message is already a turn here, by id not by text."""
+        if message_id is None:
+            return False
+        return any(mid == message_id for _, _, mid in self._log.get(key, ()))
 
     def forget(self, key: int) -> bool:
         return self._log.pop(key, None) is not None
@@ -211,6 +214,13 @@ class Conversation:
         entries = self._log.get(key)
         if entries and now - entries[-1][0] >= self.ttl:
             del self._log[key]
+
+
+def replied_turn(author: str, text: str, from_bot: bool) -> dict:
+    """The message a reply points at, as one history turn."""
+    if from_bot:
+        return {"role": "assistant", "content": text[:MAX_QUESTION_CHARS]}
+    return {"role": "user", "content": f"{author}: {text}"[:MAX_QUESTION_CHARS]}
 
 
 # Without this the model reads an attachment as an image, whatever it actually is.
@@ -267,8 +277,7 @@ def build_request(
     body = {
         **model_field(model),
         "max_tokens": max_tokens,
-        # Reasoning tokens come out of max_tokens, so a thinking model can spend
-        # the whole budget and return empty content. Chat replies don't need it.
+        # Reasoning tokens come out of max_tokens and a chat reply needs none.
         "reasoning": {"enabled": False},
         "messages": [
             {"role": "system", "content": prompt.context},
@@ -291,8 +300,7 @@ def _error_detail(payload: dict) -> str:
 
 def _raise_for_status(status: int, payload: dict) -> None:
     detail = _error_detail(payload)
-    # "No endpoints available matching your guardrail restrictions and data policy"
-    # and "No endpoints found that satisfy the max price" are the same class of problem.
+    # A guardrail refusal and a max_price refusal are one class of problem.
     if "no endpoints" in detail.lower():
         raise ChatNoEndpoints(detail)
     if status == 401:
@@ -339,8 +347,7 @@ def _extract_reply(payload: dict) -> str:
         if refusal or finish in ("content_filter", "error"):
             raise ChatRefused(refusal or f"declined ({finish})")
         detail = f"finish_reason={finish}, native={choice.get('native_finish_reason')}"
-        # Some models reason regardless of reasoning.enabled=false and spend the
-        # whole budget doing it. Worth naming - the fix is more max_tokens.
+        # Some models reason anyway and spend the whole budget on it.
         if message.get("reasoning"):
             detail += f", spent the budget reasoning ({_reasoning_tokens(payload)} tokens)"
         raise ChatEmptyReply(detail)
@@ -473,8 +480,7 @@ async def ask(
                 "content": (await tool_runner(call))[:MAX_TOOL_RESULT_CHARS],
             })
 
-        # The next round is the last, so forbid another tool call: a model that
-        # spends it asking for one returns empty content and nothing to post.
+        # The last round forbids a tool call, which would return empty content.
         if remaining == 1:
             body["tool_choice"] = "none"
 
